@@ -4,9 +4,14 @@
 
 translate-cs is a Codex/Claude Code/OpenClaw skill specialized for computer science, AI, LLM, agent, and mathematical literature. GitHub repository: `ThxOfficial/translate-cs`.
 
+Default workflow: the host model reads the original, assesses length/context, translates directly or uses TXT for a long source, edits against the original, then generates and visually checks PDF. Do not require PDF-to-Markdown preprocessing. The existing Markdown pipeline is opt-in or for resuming legacy runs.
+
 ## Structure
 
 - `SKILL.md` — Skill definition, the orchestration logic that Codex / Claude Code / OpenClaw follows
+- `scripts/source_workflow.py` — Source-first registration, optional TXT, version-bound editorial evidence and reviewed PDF build
+- `references/source-first.md` — Default workflow commands and schemas
+- `references/legacy-pipeline.md` — Compatible opt-in/resume Markdown pipeline
 - `scripts/convert.py` — PDF/DOCX/EPUB → Markdown chunks (via Calibre HTMLZ); Markdown input (e.g. from MinerU/Marker) skips Calibre
 - `scripts/manifest.py` — SHA-256 chunk tracking and merge validation
 - `scripts/glossary.py` — Term-consistency glossary; per-chunk term tables injected into sub-agent prompts
@@ -36,7 +41,7 @@ python3 -m unittest discover -s tests -p 'test_*.py' -v
 python3 -m compileall scripts tests
 ```
 
-Then test with a small PDF to verify the full pipeline:
+For the preserved legacy pipeline, test with a small PDF:
 
 ```bash
 python3 scripts/convert.py /path/to/small.pdf --olang zh

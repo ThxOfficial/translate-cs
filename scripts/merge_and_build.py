@@ -1178,6 +1178,10 @@ def main():
         print(f"Error: Temp directory not found: {temp_dir}")
         sys.exit(1)
 
+    if os.path.isfile(os.path.join(temp_dir, 'source_workflow.json')):
+        print('Source-first run: use source_workflow.py build-pdf after editorial review.')
+        sys.exit(1)
+
     cover = args.cover
     if cover:
         if not os.path.isfile(cover):

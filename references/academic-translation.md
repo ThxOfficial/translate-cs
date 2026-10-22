@@ -1,5 +1,7 @@
 # Academic translation profile
 
+This is the **legacy Markdown pipeline** contract, selected explicitly or for resuming an existing legacy run. For new translations the default is [source-first.md](source-first.md): read the original first, optionally use TXT for long sources, edit and compare before PDF. The extraction requirements and Markdown/HTML defaults below apply only to legacy mode.
+
 Use this profile for CS, AI, LLM, agent, and mathematical-method papers or technical books. It is an additive path: requests outside this scope continue through the existing generic workflow. Stage A accepts layout-aware Markdown only; PDF, DOCX, and EPUB sources must first be extracted by a parser chosen by the user or already available in the environment.
 
 For B/C capabilities, read [advanced-academic.md](advanced-academic.md). It covers explicit glossary v3 migration, separately executed review, local PDF/LaTeX adapters, native mathematical formats, exact bilingual alignment and row-group table tasks. Academic DOCX/EPUB input still requires pre-extracted Markdown; PDF and LaTeX now have opt-in adapters. For mathematical subfields, also read [math-domains.md](math-domains.md).

@@ -1,5 +1,7 @@
 # Academic stages B and C
 
+These are legacy Markdown-pipeline capabilities, used explicitly or when resuming that pipeline. They do not require a new source-first run to convert PDF to Markdown. The current default workflow and editorial/PDF gate are in [source-first.md](source-first.md).
+
 Read the relevant sections for sense-aware terminology, independent review, source adapters, native formats, or optional reading views. Keep the academic source-inspection and quality gates. Generated tests and views live in `tests/.artifacts/` during development; normal runs use their chosen temp directory. Generic translation keeps its existing interfaces and format path.
 
 ## Glossary v3 and meta v2

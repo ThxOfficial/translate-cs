@@ -2,52 +2,68 @@
 
 English | [中文](README.zh-CN.md)
 
-`translate-cs` is a Codex skill for translating computer science, AI, LLM, agent, and mathematical papers and books. It combines a resumable parallel translation pipeline with an evidence-based academic workflow.
+`translate-cs` is a Codex skill for translating computer science, AI, LLM, agent, and mathematical papers and books. The model reads the original, chooses direct translation or TXT for a long document, edits against the source, then generates a reviewed PDF.
 
 ---
 
 ## How It Works
 
 ```
-Input (PDF/DOCX/EPUB)
+Original source file (PDF/DOCX/EPUB/TXT/other readable source)
   │
   ▼
-Calibre ebook-convert → HTMLZ → HTML → Markdown
-  (or Markdown input, e.g. from MinerU / Marker, skipping Calibre)
+Model reads original pages/sections and assesses length + context budget
   │
   ▼
-Split into chunks (chunk0001.md, chunk0002.md, ...)
-  │  manifest.json tracks chunk hashes
+Manageable source → translate directly
+Long source       → export source.txt → translate bounded sections
+  │  original pages remain the authority for math, tables and figures
   ▼
-Parallel subagents (8 concurrent by default)
-  │  each subagent: read 1 chunk → translate → write output_chunk*.md
-  │  batched to respect API rate limits
-  ▼
-Validate (manifest hash check; academic mode also checks protected spans,
-          Markdown structure, and required review coverage)
+Edit and compare every requested source unit; record current review evidence
   │
   ▼
-Merge → Pandoc → HTML (with TOC) → Calibre → DOCX / EPUB / PDF
+Typeset the edited translation → book.pdf → visual inspection
 ```
 
-Each chunk gets its own independent subagent with a fresh context window. This prevents context accumulation and output truncation that happen when translating a full book in a single session.
+There is no mandatory source-to-Markdown conversion. The model chooses the route from actual source density and available context, rather than a fixed page threshold. Short sources need no TXT; long runs retain source locations, batch drafts and terminology. `output.md` is the edited target-language typesetting source created during/after translation.
 
 ## Features
 
-- **Parallel subagents** — 8 concurrent translators per batch, each with isolated context
-- **Resumable + selective re-translation** — chunk-level resume, with `run_state.json` tracking glossary-sensitive re-translation
-- **Neighbor context** — each chunk can see short read-only excerpts from adjacent chunks for pronoun and entity resolution
-- **Manifest validation** — SHA-256 hash tracking prevents stale or corrupt outputs from being merged
-- **Multi-format output** — HTML (with floating TOC), DOCX, EPUB, PDF
-- **Optional output controls** — explicit EPUB cover, custom temp root, and user-facing export aliases
+- **Original-first reading** — use actual native document/page/vision tools before choosing an extraction path
+- **Model-assessed TXT fallback** — long documents use UTF-8 TXT, with original-page checks for extraction loss
+- **Editing before PDF** — source coverage, terms, math/code, figures/tables, claims/citations and language are reviewed before rendering
+- **Version-bound evidence** — changed source, TXT, drafts, terms/progress, translation or images invalidate editorial review
+- **PDF by default** — installed Pandoc plus Word or Chromium/Edge; visual inspection is recorded separately
+- **Persistent long-document progress** — section/page ranges, batch drafts and terminology, with optional fresh worker contexts
 - **Multi-language** — zh, en, ja, ko, fr, de, es (extensible)
-- **PDF/DOCX/EPUB/Markdown input** — Calibre handles the conversion heavy lifting; formula- and table-heavy PDFs can be pre-extracted to Markdown with MinerU or Marker
-- **Academic profile** — source-checked Markdown, optional local PDF/LaTeX import, and structure-preserving translation for CS/AI/LLM/agent/math papers and books
-- **Auditable academic checks** — per-chunk context snapshots, first-occurrence term planning, deterministic structure checks, review sidecars, `quality_report.json`, and `build_report.json`
+- **Legacy compatibility** — the existing generic/academic Markdown pipeline, glossary, manifest, selective reruns and optional DOCX/EPUB outputs remain available explicitly or for old runs
 
-## Academic Translation (Stages A, B and C)
+## Default Source-First Workflow
 
-Use the academic profile for research papers and technical books in computer science, AI, LLMs, agent systems, and mathematical methods. Generic translation remains the default for other books, preserving the existing workflow and output names.
+Ask the model to translate the source directly. It records its actual reading/length assessment, registers the unchanged source, and exports TXT only if it selected the long-document path:
+
+```bash
+python3 scripts/source_workflow.py prepare paper.pdf --assessment-file assessment.json --target-lang zh
+# Only when the model selected "txt":
+python3 scripts/source_workflow.py extract-txt paper_temp
+```
+
+After translation and editing, it records complete source-to-translation comparison and then builds the PDF:
+
+```bash
+python3 scripts/source_workflow.py record-review paper_temp --evidence-file editorial-evidence.json
+python3 scripts/source_workflow.py build-pdf paper_temp --title "Translated title"
+```
+
+See the [execution contract](references/source-first.md) for actual model-authored assessment/review schemas, page coverage, TXT correction, progress, and visual inspection. The scripts do not call an LLM or prove semantic accuracy. Missing/stale editorial evidence blocks PDF generation; successful file generation remains `needs_visual_review` until the actual PDF has been inspected. Use `--rebuild` after changing title or rendering inputs; failed native rebuilds retain the previous PDF without declaring it current.
+
+The model must have reliable source-reading tools. TXT extraction does not preserve all PDF math/layout; inspect the original when correcting it. Models, OCR services and source uploads are never enabled automatically. Legacy test evidence below does not certify the new workflow's real-world translation accuracy.
+
+Validation for this change: the 320-test baseline passed; all 333 stdlib tests now pass, including 13 source-first regressions. A real two-page synthetic PDF passed the new prepare/extract CLI with installed `pdftotext`, retaining both pages and form-feed separators without creating source Markdown. Compilation and skill validation passed. This round did not evaluate actual model translation or rerun the Word/Chromium PDF renderer.
+
+## Legacy Academic Translation (Stages A, B and C)
+
+This section applies only when explicitly choosing the [legacy pipeline](references/legacy-pipeline.md) or resuming its existing run. Its `academic` profile and Markdown/HTML output defaults do not override the source-first PDF workflow above.
 
 The academic profile accepts inspected layout-aware Markdown, explicitly selected local PDF parsers, and bounded LaTeX projects. For DOCX/EPUB or unsupported layouts, first extract and inspect Markdown. A Markdown run starts with:
 
@@ -91,12 +107,14 @@ Run `python3 tests/integration/check_document_context.py` for the context/planne
 ## Prerequisites
 
 - **Agent runtime** — Codex, Claude Code, or OpenClaw, installed and ready to run skills
-- **Calibre** — `ebook-convert` command must be available ([download](https://calibre-ebook.com/))
-- **Pandoc** — for HTML↔Markdown conversion ([download](https://pandoc.org/))
-- **Python 3** with:
+- **Source reader** — native file/page/vision access supplied by the agent host
+- **Python 3.12+** — source-first helper uses only stdlib
+- **pdftotext** — optional installed tool for model-selected long-PDF TXT extraction; reader-exported UTF-8 TXT is also accepted
+- **Pandoc + installed Word or Chromium/Edge** — needed only for final PDF typesetting/rendering
+- **Legacy pipeline only:** Calibre (`ebook-convert`, [download](https://calibre-ebook.com/)), [Pandoc](https://pandoc.org/) and Python packages:
   - `pypandoc` — required (`pip install pypandoc`)
   - `beautifulsoup4` — optional, for better TOC generation (`pip install beautifulsoup4`)
-- **MinerU or Marker** — optional, only to pre-extract formula- and table-heavy PDFs to Markdown (see [Step 1](#step-1-convert))
+- **MinerU or Marker** — optional legacy Markdown adapters, not default preprocessing
 
 ## Quick Start
 
@@ -164,7 +182,7 @@ In Claude Code, you can also use the slash command:
 /translate-cs translate /path/to/book.pdf to Japanese
 ```
 
-The skill handles the pipeline — convert, chunk, translate in parallel, validate, merge, and build the requested output formats.
+The skill reads the source, assesses whether TXT is needed, translates, edits against the original, and generates/inspects the PDF.
 
 ### 3. Find your outputs
 
@@ -172,11 +190,15 @@ All files are in `{book_name}_temp/`:
 
 | File | Description |
 |------|-------------|
-| `output.md` | Merged translated Markdown |
-| `book.html` | Web version with floating TOC |
-| `book.docx` | Word document |
-| `book.epub` | E-book |
-| `book.pdf` | Print-ready PDF |
+| `source_workflow.json` | Original source identity and model routing assessment |
+| `source.txt` | Optional long-document source text |
+| `drafts/chunk*.md` | Optional translated batches |
+| `output.md` | Edited target-language typesetting source |
+| `editorial_review.json` | Source-to-translation coverage and version-bound editorial evidence |
+| `book.pdf` | Final PDF when the report is complete |
+| `build_report.json` | Actual generation and visual-inspection status |
+
+HTML/native DOCX may be retained as rendering intermediates. DOCX/EPUB deliverables and the old manifest-driven pipeline remain opt-in legacy capabilities.
 
 ## Repository Test Assets
 
@@ -184,7 +206,7 @@ All files are in `{book_name}_temp/`:
 - Generated full-pipeline outputs live under `tests/.artifacts/` and should not be committed.
 - Because `scripts/convert.py` writes `{book_name}_temp/` under the current working directory, run repository baseline tests from inside `tests/.artifacts/` to keep generated files out of the repo root.
 
-### Full-Pipeline Baseline Example
+### Legacy Full-Pipeline Baseline Example
 
 ```bash
 mkdir -p tests/.artifacts
@@ -226,7 +248,9 @@ A useful issue should include:
 
 For bugs and feature requests, open an issue in [ThxOfficial/translate-cs](https://github.com/ThxOfficial/translate-cs/issues).
 
-## Pipeline Details
+## Legacy Pipeline Details (opt-in)
+
+These commands are retained for existing runs and explicit legacy requests. New translations follow the [source-first contract](references/source-first.md); the PDF-to-Markdown conversion below is not their first step.
 
 ### Step 1: Convert
 
@@ -321,6 +345,9 @@ Then: merge → Pandoc HTML → inject TOC → Calibre generates DOCX, EPUB, PDF
 | File | Purpose |
 |------|---------|
 | `SKILL.md` | Agent skill definition — orchestrates the full pipeline |
+| `scripts/source_workflow.py` | Source registration, optional TXT, editorial evidence and PDF after review |
+| `references/source-first.md` | Current default reading/translation/editing/PDF contract |
+| `references/legacy-pipeline.md` | Compatible opt-in Markdown pipeline |
 | `scripts/convert.py` | PDF/DOCX/EPUB → Markdown chunks via Calibre HTMLZ; Markdown input skips Calibre |
 | `scripts/manifest.py` | Chunk manifest: SHA-256 tracking and merge validation |
 | `scripts/glossary.py` | Glossary management: per-chunk term tables for consistent terminology |
@@ -342,19 +369,20 @@ Then: merge → Pandoc HTML → inject TOC → Calibre generates DOCX, EPUB, PDF
 | `Calibre ebook-convert not found` | Install Calibre and ensure `ebook-convert` is in PATH |
 | `Manifest validation failed` | Source chunks changed since splitting — re-run `convert.py` |
 | `was created from different source bytes` | The temp dir belongs to a different source file — delete the temp dir or use a fresh `--temp-root` |
-| PDF formulas/tables garbled after conversion | Extract the PDF with MinerU or Marker, delete the old temp dir, and run `convert.py` on the `.md` (see [Step 1](#step-1-convert)) |
+| TXT formulas/tables are incomplete | Re-read the original pages, correct the TXT and preserve figures; do not guess missing technical content. Markdown adapters remain a legacy option. |
 | `Blank output` / `Empty output` | A subagent wrote a whitespace-only or empty chunk — re-run the skill to re-translate it |
 | `Missing source chunk` | Source file deleted — re-run `convert.py` to regenerate |
 | Incomplete translation | Re-run the skill — it resumes from where it stopped |
-| Changed title/template/assets but output didn't update | Delete existing `output.md`, `book*.html`, `book.docx`, `book.epub`, `book.pdf` from the temp dir, then re-run `merge_and_build.py` |
-| Want page-number footers stripped from PDF output | By default, monotonic page-number sequences (e.g. `1, 2, 3, ...`) are auto-detected and dropped while outliers like years (`1984`), chapter numbers, and citation indices stay preserved. If detection misses your case, pass `--strip-page-numbers` to `convert.py` to aggressively delete every standalone-digit line. The flag aborts if a cached `input.md` or `chunk*.md` already exists — delete them first so the flag actually takes effect. |
+| Changed title/template/assets but output didn't update | For source-first, refresh editorial review if tracked content changed, then run `source_workflow.py build-pdf ... --rebuild`; preserve edited `output.md`. Legacy cleanup is described above. |
+| Page numbers in TXT | Keep page locations/form-feed boundaries and check the original before removing footers. The old `convert.py --strip-page-numbers` option applies only to legacy Calibre input. |
 | `output.md exists but manifest invalid` | Stale output — the script auto-deletes and re-merges |
 | `Glossary upgrade rejected: duplicate source` | The legacy v2 glossary requires unique surfaces. For academic work, migrate explicitly to v3 with `python3 scripts/glossary.py migrate-v3 <temp_dir>`; v3 supports polysemy through reviewed occurrence bindings. |
-| PDF generation fails | Ensure Calibre is installed with PDF output support |
+| Default PDF generation fails | Inspect `build_report.json`; verify Pandoc and installed Word/Chromium/Edge |
+| PDF is blocked before rendering | Complete current source-to-translation editorial evidence; changes require a new review |
 
-## Generic Pipeline Capabilities
+## Legacy Generic Pipeline Capabilities
 
-These capabilities remain available alongside the academic profile. See [academic delivery status](docs/CS_AI_TRANSLATION_SPEC.md#135-当前尚未完成的验收和发布工作) for remaining validation items.
+These capabilities remain available in the opt-in legacy pipeline. See [academic delivery status](docs/CS_AI_TRANSLATION_SPEC.md#135-当前尚未完成的验收和发布工作) for its remaining validation items.
 
 The generic pipeline supports scoped terminology, source-grounded context, and selective re-translation. Validation on a complete, naturally translated technical book remains unfinished.
 
@@ -367,7 +395,7 @@ The generic pipeline supports scoped terminology, source-grounded context, and s
 
 ### Phase 1 — Sub-agent feedback + glossary merge (shipped)
 
-Closes the read+write loop. Glossary v2 adds `id`, `aliases`, `gender`, `confidence`, `evidence_refs`, `notes` (v1 files auto-upgrade on first load; the term table is now 3-col and aliases participate in selection). Sub-agents emit `output_chunkNNNN.meta.json` alongside each translated chunk. `scripts/merge_meta.py` (`prepare-merge` / `apply-merge` / `status`) merges per-batch with conservative rules: surface-form uniqueness enforced, malformed metas quarantined (warn + skip + count), confidence escalation via both `evidence_chunks` and `used_term_sources`, FIFO-cap at 5. See SKILL.md Step 4 / Step 4.5 / Step 5.
+Closes the read+write loop. Glossary v2 adds `id`, `aliases`, `gender`, `confidence`, `evidence_refs`, `notes` (v1 files auto-upgrade on first load; the term table is now 3-col and aliases participate in selection). Sub-agents emit `output_chunkNNNN.meta.json` alongside each translated chunk. `scripts/merge_meta.py` (`prepare-merge` / `apply-merge` / `status`) merges per-batch with conservative rules: surface-form uniqueness enforced, malformed metas quarantined (warn + skip + count), confidence escalation via both `evidence_chunks` and `used_term_sources`, FIFO-cap at 5. See [legacy steps 4–5](references/legacy-pipeline.md).
 
 ### Phase 2 — Neighbor context for pronouns (shipped)
 

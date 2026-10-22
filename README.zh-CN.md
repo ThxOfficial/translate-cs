@@ -2,51 +2,68 @@
 
 [English](README.md) | 中文
 
-`translate-cs` 是面向 Codex 的 Skill，用于翻译计算机科学、AI、LLM、Agent 和相关数学方向的论文与书籍，结合了可续跑的并行翻译流水线与基于证据的学术工作流。
+`translate-cs` 是面向 Codex 的 Skill，用于翻译计算机科学、AI、LLM、Agent 和相关数学方向的论文与书籍。模型先读原文件，自行判断直接翻译还是对长文提取 TXT，编辑并对照原文核对后再生成 PDF。
 
 ---
 
 ## 工作原理
 
 ```
-输入文件 (PDF/DOCX/EPUB)
+原始文件 (PDF/DOCX/EPUB/TXT/其他可读源文件)
   │
   ▼
-Calibre ebook-convert → HTMLZ → HTML → Markdown
-  （或直接输入 Markdown，例如 MinerU / Marker 的输出，绕过 Calibre）
+模型直接读取原页/章节，判断长度和上下文预算
   │
   ▼
-拆分为 chunk（chunk0001.md, chunk0002.md, ...）
-  │  manifest.json 记录每个 chunk 的 SHA-256 hash
+可直接处理 → 直接翻译
+较长       → 提取 source.txt → 按完整章节/页段翻译
+  │  公式、表格和图片始终以原文件为准
   ▼
-并行 subagent 翻译（默认 8 路并发）
-  │  每个 subagent：读取 1 个 chunk → 翻译 → 写入 output_chunk*.md
-  │  分批执行，控制 API 速率
-  ▼
-校验（manifest hash 比对；学术模式还检查受保护内容、Markdown 结构和审校覆盖）
+编辑译稿，逐项对照所请求的原文范围，记录当前核对证据
   │
   ▼
-合并 → Pandoc → HTML（含目录）→ Calibre → DOCX / EPUB / PDF
+已核对译稿排版 → book.pdf → 外观检查
 ```
 
-每个 chunk 由独立的 subagent 翻译，拥有全新的上下文窗口。这避免了单次会话翻译整本书时的上下文堆积和输出截断问题。
+默认没有源文件转 Markdown 的前置步骤。模型结合实际内容密度和上下文判断，不硬编码页数阈值；短文无需 TXT，长文保留源位置、分批译稿与术语记录。`output.md` 仅是翻译过程中或完成后编辑得到的目标语言排版稿。
 
 ## 功能特性
 
-- **并行 subagent** — 每批 8 个并发翻译器，各自独立上下文
-- **可续跑 + 精确重译** — chunk 级续跑，并用 `run_state.json` 追踪受术语表影响的重译范围
-- **邻居上下文** — 每个 chunk 可读取相邻 chunk 的短只读摘录，用于代词和实体判断
-- **Manifest 校验** — SHA-256 hash 追踪，防止过时或损坏的输出被合并
-- **多格式输出** — HTML（含浮动目录）、DOCX、EPUB、PDF
-- **可选输出控制** — 显式 EPUB 封面、自定义 temp root、面向用户的导出别名
+- **先读原文件** — 使用实际可用的文档、页面或视觉工具，再决定处理路径
+- **模型判断 TXT 回退** — 长文提取 UTF-8 TXT，并回看原页检查提取损失
+- **核对后生成 PDF** — 覆盖范围、术语、公式代码、图表、结论引文及语言均先核对
+- **证据绑定版本** — 原文件、TXT、分批译稿、术语/进度、编辑稿或图片变化都会使核对过期
+- **默认 PDF** — 使用已安装 Pandoc 及 Word 或 Chromium/Edge，并单独记录外观检查
+- **长文持久进度** — 保存章节/页段、分批译稿和术语；可选使用新的工作上下文
 - **多语言** — zh、en、ja、ko、fr、de、es（可扩展）
-- **多格式输入** — PDF/DOCX/EPUB/Markdown，Calibre 负责格式转换；公式、表格密集的 PDF 可先用 MinerU 或 Marker 转成 Markdown
-- **学术模式** — 支持经过来源检查的 Markdown、可选本地 PDF/LaTeX 导入，以及 CS/AI/LLM/Agent/数学文献的结构保真翻译
-- **可审计的学术检查** — 每块任务上下文快照、术语首现规划、确定性结构检查、审校 sidecar、`quality_report.json` 和 `build_report.json`
+- **旧模式兼容** — 既有通用/学术 Markdown 流水线、词表、manifest、精确重译及 DOCX/EPUB 输出继续支持显式选择和旧任务续跑
 
-## 学术翻译（阶段 A、B 和 C）
+## 默认：直接读源文件
 
-计算机科学、AI、LLM、Agent 系统及数学方法方向的研究论文和技术书籍使用 `academic` 模式。其他书籍仍默认走原来的通用翻译流程，旧入口和产物命名保持兼容。
+让模型直接翻译源文件。模型先记录实际阅读和长度判断，再登记未修改的原文件；仅在模型选择长文 TXT 路径时提取文本：
+
+```bash
+python3 scripts/source_workflow.py prepare paper.pdf --assessment-file assessment.json --target-lang zh
+# 仅当模型已选择 "txt"：
+python3 scripts/source_workflow.py extract-txt paper_temp
+```
+
+翻译和编辑完成后，记录完整的源文对照核对，再生成 PDF：
+
+```bash
+python3 scripts/source_workflow.py record-review paper_temp --evidence-file editorial-evidence.json
+python3 scripts/source_workflow.py build-pdf paper_temp --title "译后标题"
+```
+
+模型实际填写的判断/核对 JSON、页面覆盖、TXT 纠错、进度和外观检查契约见[执行说明](references/source-first.md)。脚本不调用模型，也不证明语义正确；缺失或过期核对会阻止 PDF 构建。文件生成后仍保持 `needs_visual_review`，实际检查 PDF 外观后才完成。标题或排版输入改变时显式使用 `--rebuild`；原生格式重建失败保留旧 PDF，但不会将它标为当前交付。
+
+模型必须具备可靠的源文件阅读能力。TXT 不保留全部 PDF 公式和版面，纠错时须回看原文件；不会自动启用模型、OCR 服务或上传文献。下面的旧模式测试证据不代表新流程的真实翻译准确率已获验证。
+
+本次验证：改造前 320 项基线通过，改造后全部 333 项 stdlib 单测通过，其中新增 13 项直接读源文件流程回归。真实双页合成 PDF 通过新 prepare/extract CLI 和本机 `pdftotext`，保留两页内容与分页符，没有生成源 Markdown；编译和 Skill 校验通过。本轮没有实际评测模型翻译，也没有重跑 Word/Chromium PDF 渲染器。
+
+## 旧学术流水线（阶段 A、B 和 C）
+
+本节只适用于明确选择[旧流水线](references/legacy-pipeline.md)或续跑既有旧任务。其 `academic` profile 和 Markdown/HTML 默认输出不能覆盖上面的直接读源文件、最终 PDF 流程。
 
 学术模式接受已检查的版面感知 Markdown、显式选择的本地 PDF 解析器，以及有边界的 LaTeX 工程。DOCX/EPUB 或不支持的版面先提取并检查 Markdown。Markdown 入口示例：
 
@@ -90,12 +107,14 @@ python3 scripts/quality.py <temp_dir> --record-input-review \
 ## 前置要求
 
 - **Agent 运行环境** — Codex、Claude Code 或 OpenClaw，已安装并可运行 Skill
-- **Calibre** — `ebook-convert` 命令可用（[下载](https://calibre-ebook.com/)）
-- **Pandoc** — 用于 HTML↔Markdown 转换（[下载](https://pandoc.org/)）
-- **Python 3**，需要：
+- **源文件阅读工具** — Agent 宿主提供原文件、页面或视觉读取能力
+- **Python 3.12+** — 新流程脚本只依赖标准库
+- **pdftotext** — 可选，用于模型选定的长 PDF → TXT；也可接受阅读工具导出的 UTF-8 TXT
+- **Pandoc + 已安装 Word 或 Chromium/Edge** — 仅最终 PDF 排版/渲染需要
+- **仅旧流水线需要**：Calibre（`ebook-convert`，[下载](https://calibre-ebook.com/)）、[Pandoc](https://pandoc.org/) 和 Python 包：
   - `pypandoc` — 必需（`pip install pypandoc`）
   - `beautifulsoup4` — 可选，用于更好的目录生成（`pip install beautifulsoup4`）
-- **MinerU 或 Marker** — 可选，仅用于把公式、表格密集的 PDF 预先转成 Markdown（见[第一步](#第一步转换)）
+- **MinerU 或 Marker** — 可选的旧模式 Markdown 适配器，不是默认预处理
 
 ## 快速开始
 
@@ -163,7 +182,7 @@ translate /path/to/book.pdf to Chinese
 /translate-cs translate /path/to/book.pdf to Japanese
 ```
 
-Skill 负责处理流程 — 转换、拆分、并行翻译、校验、合并和生成所请求的输出格式。
+Skill 负责直接读取源文件、判断是否需要 TXT、翻译、编辑对照、生成 PDF 并检查外观。
 
 ### 3. 查看输出
 
@@ -171,11 +190,15 @@ Skill 负责处理流程 — 转换、拆分、并行翻译、校验、合并和
 
 | 文件 | 说明 |
 |------|------|
-| `output.md` | 合并后的翻译 Markdown |
-| `book.html` | 网页版，含浮动目录 |
-| `book.docx` | Word 文档 |
-| `book.epub` | 电子书 |
-| `book.pdf` | 可打印 PDF |
+| `source_workflow.json` | 原文件身份与模型路径判断 |
+| `source.txt` | 可选的长文源文本 |
+| `drafts/chunk*.md` | 可选的分批译稿 |
+| `output.md` | 编辑完成的目标语言排版稿 |
+| `editorial_review.json` | 源文覆盖及版本绑定的编辑核对证据 |
+| `book.pdf` | 报告为 complete 时的最终 PDF |
+| `build_report.json` | 实际生成和外观检查状态 |
+
+HTML/原生 DOCX 可能作为渲染中间文件保留。DOCX/EPUB 交付与原 manifest 流水线仍可显式选择旧模式使用。
 
 ## 仓库测试资产
 
@@ -183,7 +206,7 @@ Skill 负责处理流程 — 转换、拆分、并行翻译、校验、合并和
 - 完整流水线跑出来的产物统一放在 `tests/.artifacts/`，不提交到版本库。
 - 由于 `scripts/convert.py` 会把 `{book_name}_temp/` 写到**当前工作目录**下，仓库内的 baseline 测试应从 `tests/.artifacts/` 目录里启动，这样生成文件不会散落到仓库根目录。
 
-### 完整基准测试示例
+### 旧流水线完整基准测试示例
 
 ```bash
 mkdir -p tests/.artifacts
@@ -225,7 +248,9 @@ Pull request 不是首选贡献入口，可能会被关闭并转为 issue 继续
 
 Bug 和功能需求请提交到 [ThxOfficial/translate-cs](https://github.com/ThxOfficial/translate-cs/issues)。
 
-## 流程详解
+## 旧流水线详解（显式选择）
+
+以下命令保留给既有任务和显式旧模式请求。新翻译遵循[直接读源文件契约](references/source-first.md)，不会以下面的 PDF 转 Markdown 为第一步。
 
 ### 第一步：转换
 
@@ -320,6 +345,9 @@ python3 scripts/merge_and_build.py --temp-dir book_temp --title "《译后书名
 | 文件 | 用途 |
 |------|------|
 | `SKILL.md` | Agent Skill 定义 — 编排完整流程 |
+| `scripts/source_workflow.py` | 源文件登记、可选 TXT、编辑核对证据及核对后 PDF |
+| `references/source-first.md` | 当前默认的阅读/翻译/编辑/PDF 契约 |
+| `references/legacy-pipeline.md` | 兼容的显式旧 Markdown 流水线 |
 | `scripts/convert.py` | PDF/DOCX/EPUB → Markdown chunks（经 Calibre HTMLZ）；Markdown 输入不经过 Calibre |
 | `scripts/manifest.py` | Chunk manifest：SHA-256 追踪与合并校验 |
 | `scripts/glossary.py` | 术语表管理：为每个 chunk 生成专属术语对照表，保证全书译名一致 |
@@ -341,19 +369,20 @@ python3 scripts/merge_and_build.py --temp-dir book_temp --title "《译后书名
 | `Calibre ebook-convert not found` | 安装 Calibre，确保 `ebook-convert` 在 PATH 中 |
 | `Manifest validation failed` | 源 chunk 在拆分后被修改 — 重新运行 `convert.py` |
 | `was created from different source bytes` | temp 目录属于另一个源文件 — 删除 temp 目录或换一个 `--temp-root` |
-| PDF 转换后公式、表格错乱 | 用 MinerU 或 Marker 转出 Markdown，删除旧 temp 目录，再对 `.md` 运行 `convert.py`（见[第一步](#第一步转换)） |
+| TXT 中公式、表格不完整 | 回看原页，校正 TXT 并保留图片，不猜测缺失技术内容；Markdown 适配器仍作为旧模式选项保留。 |
 | `Blank output` / `Empty output` | 某个 subagent 写出了空白或空的 chunk — 重新运行 skill 让它重译 |
 | `Missing source chunk` | 源文件被删除 — 重新运行 `convert.py` 重新生成 |
 | 翻译不完整 | 重新运行 Skill，会从中断处继续 |
-| 修改标题、模板或图片后输出未更新 | 删除 temp 目录中的 `output.md`、`book*.html`、`book.docx`、`book.epub`、`book.pdf`，然后重跑 `merge_and_build.py` |
-| 想去掉 PDF 输出中的页码 | 默认会自动识别单调递增的页码序列（如 `1, 2, 3, ...`）并删除，同时保留年份（`1984`）、章节编号、引用编号等离散的独立数字行。若识别不到你的页码格式，可给 `convert.py` 加 `--strip-page-numbers`，强制删除所有独立数字行。该标志在检测到已缓存的 `input.md` 或 `chunk*.md` 时会直接报错 — 需先删除这些缓存，标志才会生效 |
+| 修改标题、模板或图片后输出未更新 | 新流程中，跟踪内容改变后先更新核对，再执行 `source_workflow.py build-pdf ... --rebuild`，保留编辑稿 `output.md`。旧模式清理方式见上文。 |
+| TXT 中的页码 | 保留分页符和源位置，移除页脚前先与原页核对；`convert.py --strip-page-numbers` 仅适用于旧模式 Calibre 输入。 |
 | `output.md exists but manifest invalid` | 旧输出已过时 — 脚本会自动删除并重新合并 |
 | `Glossary upgrade rejected: duplicate source` | 旧版 v2 词表要求表面词唯一。学术翻译可显式运行 `python3 scripts/glossary.py migrate-v3 <temp_dir>` 迁移到 v3，再用经过审阅的词面绑定解决多义词。 |
-| PDF 生成失败 | 确认 Calibre 已安装且支持 PDF 输出 |
+| 默认 PDF 生成失败 | 检查 `build_report.json`，确认 Pandoc 及 Word/Chromium/Edge 可用 |
+| PDF 在渲染前被阻止 | 完成当前源文对照核对；文件改动后需要重新核对 |
 
-## 通用流水线能力
+## 旧通用流水线能力
 
-这些能力与学术 profile 并行保留。尚未完成的验证事项见[学术交付状态](docs/CS_AI_TRANSLATION_SPEC.md#135-当前尚未完成的验收和发布工作)。
+这些能力保留在可选的旧流水线中，其尚未完成的验证事项见[学术交付状态](docs/CS_AI_TRANSLATION_SPEC.md#135-当前尚未完成的验收和发布工作)。
 
 通用流水线支持有作用域的术语、来源证据上下文和精确重译。真实技术书籍的整本翻译尚未完成自然度验证。
 
@@ -366,7 +395,7 @@ python3 scripts/merge_and_build.py --temp-dir book_temp --title "《译后书名
 
 ### Phase 1 — 子 agent 反馈 + 术语表合并（已发布）
 
-闭合读写回路。术语表 v2 新增 `id`、`aliases`、`gender`、`confidence`、`evidence_refs`、`notes`（v1 文件首次加载时自动升级；术语表现在是 3 列，`aliases` 参与选词链路）。子 agent 在输出译文的同时生成 `output_chunkNNNN.meta.json`。新增 `scripts/merge_meta.py`（`prepare-merge` / `apply-merge` / `status`）按批次执行保守合并：跨术语 surface form 唯一性、坏 meta 隔离（warn + skip + count）、`evidence_chunks` 与 `used_term_sources` 双路 confidence 升级、FIFO 上限 5。详见 SKILL.md Step 4 / Step 4.5 / Step 5。
+闭合读写回路。术语表 v2 新增 `id`、`aliases`、`gender`、`confidence`、`evidence_refs`、`notes`（v1 文件首次加载时自动升级；术语表现在是 3 列，`aliases` 参与选词链路）。子 agent 在输出译文的同时生成 `output_chunkNNNN.meta.json`。新增 `scripts/merge_meta.py`（`prepare-merge` / `apply-merge` / `status`）按批次执行保守合并：跨术语 surface form 唯一性、坏 meta 隔离（warn + skip + count）、`evidence_chunks` 与 `used_term_sources` 双路 confidence 升级、FIFO 上限 5。详见[旧流程第 4–5 步](references/legacy-pipeline.md)。
 
 ### Phase 2 — 代词的邻居上下文（已发布）
 
