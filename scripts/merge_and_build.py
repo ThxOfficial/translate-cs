@@ -13,12 +13,14 @@ import glob
 import shutil
 import subprocess
 import argparse
+import json
 import html as _html_lib
 from collections import Counter
 from html.parser import HTMLParser
 from pathlib import Path
 
 from manifest import read_output_text, validate_for_merge
+import quality as academic_quality
 
 
 # =============================================================================
@@ -280,7 +282,7 @@ def natural_sort_key(text):
 # Step 4: Merge translated markdown files
 # =============================================================================
 
-def merge_markdown_files(temp_dir):
+def merge_markdown_files(temp_dir, force=False):
     """Merge all translated output files into output.md"""
     print("=== Merging translated markdown files ===")
 
@@ -291,12 +293,12 @@ def merge_markdown_files(temp_dir):
 
     # Image structure validation runs unconditionally — bad chunks invalidate any cached output.md
     if not _validate_chunk_images(temp_dir):
-        if os.path.exists(output_md):
+        if os.path.exists(output_md) and not force:
             print("Removing stale output.md (built from chunks that failed image validation)")
             os.remove(output_md)
         return False
 
-    if os.path.exists(output_md):
+    if os.path.exists(output_md) and not force:
         if not ok:
             print(f"WARNING: output.md exists but manifest validation failed — deleting stale output.md")
             os.remove(output_md)
@@ -315,6 +317,8 @@ def merge_markdown_files(temp_dir):
             else:
                 print(f"Skipping merge - output.md already exists and is up to date")
                 return True
+    elif os.path.exists(output_md) and force:
+        print("Rebuilding output.md because --rebuild was requested")
 
     if not ok:
         print("ERROR: Merge validation failed. Fix the issues above before merging.")
@@ -426,22 +430,56 @@ def check_pandoc_available():
         return False
 
 
-def convert_with_pandoc(md_file, html_file, title, lang_attr):
+def convert_with_pandoc(md_file, html_file, title, lang_attr, academic=False):
     """Convert markdown to HTML using pandoc"""
+    reader = 'markdown+smart+east_asian_line_breaks'
+    if academic:
+        # Pandoc's default Markdown reader does not recognize \(...\) or
+        # \[...\]. It can succeed while consuming their TeX as prose.
+        reader = ('markdown-smart+east_asian_line_breaks'
+                  '+tex_math_single_backslash+tex_math_double_backslash')
     cmd = [
         'pandoc', md_file, '-o', html_file,
         '--standalone',
         '--metadata', f'title={title}',
         '--metadata', f'lang={lang_attr}',
-        '--from', 'markdown+smart+east_asian_line_breaks',
+        '--from', reader,
         '--to', 'html5',
         # Without this, pandoc emits any TeX it cannot approximate in plain
         # HTML (fractions, roots, display math) as raw `$...$` text.
         '--mathml'
     ]
+    log_file = html_file + '.pandoc.json'
+    if academic:
+        # Inspect structured diagnostics: localization warnings do not mean
+        # the math failed, but a TeX conversion warning must block completion.
+        cmd.append('--log=' + log_file)
+        if os.path.exists(log_file):
+            os.remove(log_file)
 
     try:
-        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True,
+                                **({'encoding': 'utf-8'} if academic else {}))
+        if academic:
+            try:
+                with open(log_file, encoding='utf-8') as handle:
+                    diagnostics = json.load(handle)
+                if not isinstance(diagnostics, list) or any(not isinstance(item, dict) for item in diagnostics):
+                    raise ValueError('expected a diagnostic array')
+            except (OSError, ValueError) as exc:
+                print(f"Cannot validate Pandoc rendering diagnostics: {exc}")
+                return False
+            if any(item.get('type') == 'CouldNotConvertTeXMath' for item in diagnostics):
+                print(f"Pandoc could not render all TeX math; see {log_file}")
+                return False
+            if result.stderr.strip():
+                print(result.stderr.strip())
+            # Offline, inert source HTML. MathML and local images remain usable;
+            # source research snippets cannot execute as browser instructions.
+            rendered = Path(html_file).read_text(encoding='utf-8')
+            css = Path(__file__).with_name('academic.css').read_text(encoding='utf-8')
+            rendered = rendered.replace('</head>', '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; img-src file: data:; style-src \'unsafe-inline\'; font-src file: data:"><style>' + css + '</style></head>')
+            Path(html_file).write_text(rendered, encoding='utf-8')
         print("Converted with pandoc")
         return True
     except subprocess.CalledProcessError as e:
@@ -630,7 +668,7 @@ def process_html_separators(html_file):
         print(f"Error processing separators: {e}")
 
 
-def convert_md_to_html(temp_dir, title, lang_cfg, author=None):
+def convert_md_to_html(temp_dir, title, lang_cfg, author=None, academic=False, force=False):
     """Convert output.md to HTML with templates"""
     print("=== Converting markdown to HTML ===")
 
@@ -641,8 +679,9 @@ def convert_md_to_html(temp_dir, title, lang_cfg, author=None):
 
     book_doc_file = os.path.join(temp_dir, 'book_doc.html')
 
-    # Skip HTML generation if book_doc.html exists and is newer than output.md
-    if os.path.exists(book_doc_file):
+    # Keep the established generic cache behavior. Academic mode always renders
+    # through Pandoc MathML so a generic/stale HTML file cannot hide a lossy path.
+    if not academic and not force and os.path.exists(book_doc_file):
         if os.path.getmtime(book_doc_file) > os.path.getmtime(md_file):
             if _check_generated_html_sanity(book_doc_file):
                 print("Skipping HTML generation - book_doc.html is up to date")
@@ -654,16 +693,25 @@ def convert_md_to_html(temp_dir, title, lang_cfg, author=None):
 
     temp_html_file = os.path.join(temp_dir, 'output.html')
 
-    # Try pandoc -> python-markdown -> basic regex
-    success = False
-    if check_pandoc_available():
-        success = convert_with_pandoc(md_file, temp_html_file, title, lang_cfg['lang_attr'])
+    if academic:
+        if not check_pandoc_available():
+            print("Academic HTML rendering requires Pandoc with MathML support; refusing a lossy fallback.")
+            return False
+        success = convert_with_pandoc(md_file, temp_html_file, title, lang_cfg['lang_attr'], academic=True)
+        if not success:
+            print("Academic Pandoc rendering failed; no fallback renderer was used.")
+            return False
+    else:
+        # Generic mode retains its existing renderer fallback order.
+        success = False
+        if check_pandoc_available():
+            success = convert_with_pandoc(md_file, temp_html_file, title, lang_cfg['lang_attr'])
 
-    if not success:
-        success = convert_with_python_markdown(md_file, temp_html_file, title)
+        if not success:
+            success = convert_with_python_markdown(md_file, temp_html_file, title)
 
-    if not success:
-        success = convert_with_basic_regex(md_file, temp_html_file, title)
+        if not success:
+            success = convert_with_basic_regex(md_file, temp_html_file, title)
 
     if not success:
         print("Error: All markdown-to-HTML converters failed")
@@ -691,6 +739,13 @@ def convert_md_to_html(temp_dir, title, lang_cfg, author=None):
     template_web = os.path.join(SCRIPT_DIR, 'template.html')
     book_file = os.path.join(temp_dir, 'book.html')
     apply_template_to_html(body_content, template_web, book_file, title, lang_cfg, author)
+
+    if academic:
+        css = Path(__file__).with_name('academic.css').read_text(encoding='utf-8')
+        for artifact in (book_doc_file, book_file):
+            content = Path(artifact).read_text(encoding='utf-8')
+            content = content.replace('</head>', '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; img-src file: data:; style-src \'unsafe-inline\'; font-src file: data:"><style>' + css + '</style></head>')
+            Path(artifact).write_text(content, encoding='utf-8')
 
     if not _check_generated_html_sanity(book_doc_file):
         return False
@@ -879,15 +934,17 @@ def add_toc(temp_dir):
 # Step 7: Generate DOCX/EPUB/PDF with error transparency
 # =============================================================================
 
-def generate_format(html_file, temp_dir, output_ext, lang_attr, cover=None):
+def generate_format(html_file, temp_dir, output_ext, lang_attr, cover=None, force=False, details=None):
     """Generate a specific format using calibre_html_publish.py"""
     output_file = os.path.join(temp_dir, f"book{output_ext}")
     cover = cover if output_ext == '.epub' else None
     if cover and not os.path.isfile(cover):
         print(f"Cover image not found: {cover}")
+        if details is not None:
+            details.update({"status": "failed", "renderer": "calibre_html_publish", "engine": "ebook-convert"})
         return None
 
-    if os.path.exists(output_file):
+    if os.path.exists(output_file) and not force:
         output_mtime = os.path.getmtime(output_file)
 
         # Check if source HTML is newer
@@ -908,6 +965,9 @@ def generate_format(html_file, temp_dir, output_ext, lang_attr, cover=None):
         if not html_newer and not images_newer and not cover_newer:
             file_size = os.path.getsize(output_file)
             print(f"Skipping {output_ext} - already exists and up to date ({file_size:,} bytes)")
+            if details is not None:
+                details.update({"status": "ok", "cache": "reused_existing_artifact", "file_size_bytes": file_size,
+                                "renderer": "existing_artifact", "engine": None})
             return output_file
         else:
             reasons = []
@@ -918,10 +978,14 @@ def generate_format(html_file, temp_dir, output_ext, lang_attr, cover=None):
             if cover_newer:
                 reasons.append("cover image changed")
             print(f"Rebuilding {output_ext} - {', '.join(reasons)}")
+    elif os.path.exists(output_file) and force:
+        print(f"Rebuilding {output_ext} because --rebuild was requested")
 
     publish_script = os.path.join(SCRIPT_DIR, "calibre_html_publish.py")
     if not os.path.exists(publish_script):
         print(f"calibre_html_publish.py not found at: {publish_script}")
+        if details is not None:
+            details.update({"status": "failed", "renderer": "calibre_html_publish", "engine": "ebook-convert"})
         return None
 
     try:
@@ -932,6 +996,20 @@ def generate_format(html_file, temp_dir, output_ext, lang_attr, cover=None):
 
         if os.path.exists(output_file):
             file_size = os.path.getsize(output_file)
+            if details is not None:
+                engine_match = re.search(
+                    r"Found Calibre ebook-convert:\s*(.+?)(?:\s+\(([^\r\n]+)\))?(?:\r?\n|$)",
+                    result.stdout or "",
+                )
+                details.update({
+                    "status": "ok",
+                    "cache": "generated",
+                    "file_size_bytes": file_size,
+                    "renderer": "calibre_html_publish",
+                    "engine": "ebook-convert",
+                    "engine_path": engine_match.group(1).strip() if engine_match else None,
+                    "engine_version": engine_match.group(2).strip() if engine_match and engine_match.group(2) else None,
+                })
             return output_file
         else:
             print(f"Failed to generate {output_ext}")
@@ -944,15 +1022,26 @@ def generate_format(html_file, temp_dir, output_ext, lang_attr, cover=None):
             print(f"  stdout: {e.stdout[-500:]}")
         if e.stderr:
             print(f"  stderr: {e.stderr[-500:]}")
+        if details is not None:
+            details.update({"status": "failed", "renderer": "calibre_html_publish", "engine": "ebook-convert"})
         return None
     except Exception as e:
         print(f"Error generating {output_ext}: {e}")
+        if details is not None:
+            details.update({"status": "failed", "renderer": "calibre_html_publish", "engine": "ebook-convert"})
         return None
 
 
-def generate_formats(temp_dir, lang_attr, cover=None):
+def generate_formats(temp_dir, lang_attr, cover=None, requested_formats=None, return_results=False, force=False):
     """Generate DOCX, EPUB, and PDF with result summary"""
     print("=== Generating output formats ===")
+    spec_path = Path(temp_dir) / 'translation_spec.json'
+    if spec_path.is_file() and json.loads(spec_path.read_text(encoding='utf-8')).get('profile') == 'academic':
+        import academic_formats
+        names = requested_formats if requested_formats is not None else ['docx', 'epub', 'pdf']
+        results = {'.' + name: academic_formats.build(temp_dir, name, lang_attr, force, cover)
+                   for name in names if name in ('docx', 'epub', 'pdf')}
+        return results if return_results else all(r['status'] == 'ok' for r in results.values())
 
     html_file = os.path.join(temp_dir, "book_doc.html")
     if not os.path.exists(html_file):
@@ -961,28 +1050,68 @@ def generate_formats(temp_dir, lang_attr, cover=None):
             html_file = max(html_files, key=os.path.getmtime)
         else:
             print("No HTML files found for format generation")
-            return
+            return {} if return_results else False
 
     results = {}
-    for ext in ['.docx', '.epub', '.pdf']:
-        result = generate_format(html_file, temp_dir, ext, lang_attr, cover=cover)
+    format_extensions = {"docx": ".docx", "epub": ".epub", "pdf": ".pdf"}
+    if requested_formats is None:
+        extensions = list(format_extensions.values())
+    else:
+        extensions = [format_extensions[name] for name in requested_formats if name in format_extensions]
+
+    for ext in extensions:
+        format_details = {} if return_results else None
+        result = generate_format(html_file, temp_dir, ext, lang_attr, cover=cover, force=force, details=format_details)
         if result:
             file_size = os.path.getsize(result)
-            results[ext] = ('OK', f"{file_size:,} bytes")
+            if return_results:
+                format_details.setdefault("status", "ok")
+                format_details.setdefault("file_size_bytes", file_size)
+                results[ext] = format_details
+            else:
+                results[ext] = ('OK', f"{file_size:,} bytes")
         else:
-            results[ext] = ('FAILED', '')
+            results[ext] = format_details or {"status": "failed", "renderer": "calibre_html_publish", "engine": "ebook-convert"} if return_results else ('FAILED', '')
 
     # Print summary table
     print("\nFormat results:")
     has_failures = False
-    for ext, (status, detail) in results.items():
+    for ext, result in results.items():
+        if return_results:
+            status = 'OK' if result.get("status") == "ok" else 'FAILED'
+            detail = f"{result.get('file_size_bytes', 0):,} bytes"
+        else:
+            status, detail = result
         if status == 'OK':
             print(f"  {ext}: {status} ({detail})")
         else:
             print(f"  {ext}: {status}")
             has_failures = True
 
-    return not has_failures
+    return results if return_results else not has_failures
+
+
+def _write_academic_build_report(temp_dir, quality_status, requested_formats, format_results, build_status,
+                                html_renderer_status='not_run'):
+    report = {
+        'schema_version': 1,
+        'profile': 'academic',
+        'quality_status': quality_status,
+        'build_status': build_status,
+        'requested_formats': requested_formats,
+        'formats': format_results,
+        'rendering': {
+            'html_renderer': 'pandoc',
+            'math_output': 'mathml',
+            'status': html_renderer_status,
+        },
+    }
+    report_path = os.path.join(temp_dir, 'build_report.json')
+    with open(report_path + '.tmp', 'w', encoding='utf-8', newline='\n') as f:
+        json.dump(report, f, ensure_ascii=False, indent=2, sort_keys=True)
+        f.write('\n')
+    os.replace(report_path + '.tmp', report_path)
+    return report
 
 
 def _validate_export_name(name):
@@ -1035,6 +1164,12 @@ def main():
     parser.add_argument('--cover', default=None, help='Cover image path for EPUB output')
     parser.add_argument('--export-name', default=None, help='Optional filename stem for exported alias copies')
     parser.add_argument('--cleanup', action='store_true', help='Remove intermediate artifacts after successful build')
+    parser.add_argument('--format', dest='requested_formats', choices=('md', 'html', 'docx', 'epub', 'pdf'),
+                        action='append', default=None, help='Requested output format; repeat as needed')
+    parser.add_argument('--allow-draft', action='store_true',
+                        help='Build an explicitly marked draft when academic semantic review is incomplete')
+    parser.add_argument('--rebuild', action='store_true',
+                        help='Force regeneration of derived merged/rendered artifacts without changing translations or review evidence')
 
     args = parser.parse_args()
     temp_dir = args.temp_dir
@@ -1060,6 +1195,53 @@ def main():
 
     # Load config as base, CLI args override
     config = load_config(temp_dir)
+    spec_path = os.path.join(temp_dir, 'translation_spec.json')
+    translation_spec = {}
+    if os.path.isfile(spec_path):
+        try:
+            with open(spec_path, 'r', encoding='utf-8') as f:
+                translation_spec = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"Error reading translation_spec.json: {e}")
+            sys.exit(1)
+    academic_profile = translation_spec.get('profile') == 'academic'
+    requested_formats = args.requested_formats
+    if requested_formats is None and academic_profile:
+        requested_formats = translation_spec.get('requested_formats', ['md', 'html'])
+    quality_report = None
+    if academic_profile:
+        if not isinstance(requested_formats, list) or not requested_formats or any(
+            fmt not in ('md', 'html', 'docx', 'epub', 'pdf') for fmt in requested_formats
+        ) or len(requested_formats) != len(set(requested_formats)):
+            print("Error: Academic requested_formats must be a non-empty list of unique supported formats")
+            sys.exit(1)
+        try:
+            quality_report = academic_quality.build_quality_report(temp_dir)
+            academic_quality.write_quality_report(temp_dir, quality_report)
+        except Exception as e:
+            print(f"Error checking academic translation quality: {e}")
+            _write_academic_build_report(
+                temp_dir, 'blocked', requested_formats,
+                {fmt: {'status': 'failed', 'path': {'md': 'output.md', 'html': 'book.html', 'docx': 'book.docx', 'epub': 'book.epub', 'pdf': 'book.pdf'}[fmt]} for fmt in requested_formats},
+                'failed',
+            )
+            sys.exit(1)
+        if quality_report['quality_status'] == 'blocked':
+            print("Academic quality checks found blocking errors; see quality_report.md")
+            _write_academic_build_report(
+                temp_dir, 'blocked', requested_formats,
+                {fmt: {'status': 'failed', 'path': {'md': 'output.md', 'html': 'book.html', 'docx': 'book.docx', 'epub': 'book.epub', 'pdf': 'book.pdf'}[fmt]} for fmt in requested_formats},
+                'failed',
+            )
+            sys.exit(1)
+        if quality_report['quality_status'] == 'needs_review' and not args.allow_draft:
+            print("Academic semantic review is incomplete; see quality_report.md. Use --allow-draft to build a marked draft.")
+            _write_academic_build_report(
+                temp_dir, 'needs_review', requested_formats,
+                {fmt: {'status': 'not_built', 'path': {'md': 'output.md', 'html': 'book.html', 'docx': 'book.docx', 'epub': 'book.epub', 'pdf': 'book.pdf'}[fmt]} for fmt in requested_formats},
+                'failed',
+            )
+            sys.exit(2)
 
     lang_code = args.lang or config.get('output_lang', 'zh')
     lang_cfg = get_lang_config(lang_code)
@@ -1073,19 +1255,75 @@ def main():
     print(f"Author: {author}")
     print(f"Language: {lang_code} (attr: {lang_cfg['lang_attr']})")
 
+    academic_outputs = {
+        'md': 'output.md', 'html': 'book.html', 'docx': 'book.docx',
+        'epub': 'book.epub', 'pdf': 'book.pdf',
+    }
+    academic_format_results = {
+        fmt: {'status': 'failed', 'path': academic_outputs[fmt]}
+        for fmt in requested_formats
+    } if academic_profile else None
+
     # Step 4: Merge
-    if not merge_markdown_files(temp_dir):
+    merge_ok = merge_markdown_files(temp_dir, force=True) if args.rebuild else merge_markdown_files(temp_dir)
+    if not merge_ok:
+        if academic_profile:
+            _write_academic_build_report(temp_dir, quality_report['quality_status'], requested_formats, academic_format_results, 'failed')
         sys.exit(1)
+    if academic_profile and 'md' in academic_format_results:
+        academic_format_results['md']['status'] = 'ok'
 
     # Step 5: Convert to HTML
-    if not convert_md_to_html(temp_dir, title, lang_cfg, author):
+    html_ok = (
+        convert_md_to_html(temp_dir, title, lang_cfg, author, academic=academic_profile, force=True)
+        if args.rebuild else
+        convert_md_to_html(temp_dir, title, lang_cfg, author, academic=academic_profile)
+    )
+    if not html_ok:
+        if academic_profile:
+            _write_academic_build_report(temp_dir, quality_report['quality_status'], requested_formats,
+                                         academic_format_results, 'failed', html_renderer_status='failed')
         sys.exit(1)
+    if academic_profile and 'html' in academic_format_results:
+        academic_format_results['html']['status'] = 'ok'
 
     # Step 6: Add TOC
     add_toc(temp_dir)
 
     # Step 7: Generate formats
-    all_formats_ok = generate_formats(temp_dir, lang_cfg['lang_attr'], cover=cover)
+    format_kwargs = {
+        "cover": cover,
+        "requested_formats": requested_formats,
+        "return_results": academic_profile,
+    }
+    if args.rebuild:
+        format_kwargs["force"] = True
+    generated_formats = generate_formats(temp_dir, lang_cfg['lang_attr'], **format_kwargs)
+    all_formats_ok = generated_formats if not academic_profile else True
+
+    if academic_profile:
+        for fmt in requested_formats:
+            if fmt in ('docx', 'epub', 'pdf'):
+                result = generated_formats.get('.' + fmt)
+                path = os.path.join(temp_dir, academic_outputs[fmt])
+                academic_format_results[fmt]['status'] = (
+                    'ok' if isinstance(result, dict) and result.get('status') == 'ok'
+                    and os.path.isfile(path) and os.path.getsize(path) > 0 else 'failed'
+                )
+                if isinstance(result, dict):
+                    academic_format_results[fmt].update({key: value for key, value in result.items() if key != 'status'})
+                    academic_format_results[fmt]['status'] = (
+                        result.get('status', 'failed') if os.path.isfile(path) and os.path.getsize(path) > 0
+                        else 'failed'
+                    )
+            all_formats_ok = all_formats_ok and academic_format_results[fmt]['status'] == 'ok'
+        build_status = 'complete' if all(item['status'] == 'ok' for item in academic_format_results.values()) else 'partial'
+        if quality_report['quality_status'] == 'needs_review':
+            build_status = 'draft' if build_status == 'complete' else 'partial'
+        _write_academic_build_report(
+            temp_dir, quality_report['quality_status'], requested_formats, academic_format_results, build_status,
+            html_renderer_status='ok',
+        )
 
     if export_name:
         if all_formats_ok:
@@ -1109,10 +1347,17 @@ def main():
 
     # Cleanup intermediate artifacts if requested (skip if any format failed)
     if args.cleanup:
-        if all_formats_ok:
+        if academic_profile and quality_report['quality_status'] != 'validated':
+            print("\nSkipping cleanup — academic draft evidence is retained.")
+        elif all_formats_ok:
             cleanup_intermediate_files(temp_dir)
         else:
             print("\nSkipping cleanup — some formats failed. Intermediate files kept for diagnosis/retry.")
+
+    if academic_profile:
+        if quality_report['quality_status'] == 'needs_review' or not all_formats_ok:
+            return 2
+        return 0
 
 
 def cleanup_intermediate_files(temp_dir):
@@ -1148,4 +1393,4 @@ def cleanup_intermediate_files(temp_dir):
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

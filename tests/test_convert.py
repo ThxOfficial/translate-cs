@@ -1,4 +1,7 @@
 import os
+import argparse
+import hashlib
+import json
 import sys
 import tempfile
 import unittest
@@ -509,6 +512,105 @@ class DisplayMathBlockTests(unittest.TestCase):
         blocks = convert.parse_structural_blocks(content)
         chunks = convert.merge_blocks_to_chunks(blocks, target_size=200)
         self.assertEqual(sum(formula in chunk for chunk in chunks), 1)
+
+
+class AcademicChunkingTests(unittest.TestCase):
+    def test_academic_subjects_are_normalized_and_limited_to_supported_fields(self):
+        args = argparse.Namespace(
+            profile="academic", document_kind="paper", subjects=["AI", "llm", "ai"],
+            ilang="en", olang="zh", review_mode="risk_based", review_sample_rate=0.1,
+            requested_formats=["md", "html"], custom_instructions=None, chunk_size=100,
+        )
+        settings = convert._resolve_translation_settings(args, tempfile.gettempdir())
+        self.assertEqual(settings["subjects"], ["ai", "llm"])
+
+        args.subjects = ["neuroscience"]
+        with self.assertRaisesRegex(ValueError, "Unsupported academic subject"):
+            convert._resolve_translation_settings(args, tempfile.gettempdir())
+
+    def test_academic_profile_preserves_oversized_atomic_blocks(self):
+        blocks = [("a" * 15 + "\n\n" + "b" * 15 + "\n\n" + "c" * 15, "paragraph")]
+        generic = convert.merge_blocks_to_chunks(blocks, target_size=20)
+        academic = convert.merge_blocks_to_chunks(blocks, target_size=20, academic=True)
+        self.assertGreater(len(generic), 1)
+        self.assertEqual(academic, [blocks[0][0]])
+
+    def test_academic_scanner_keeps_tilde_fences_and_latex_environments_atomic(self):
+        code = "~~~python\nrun_eval()\n\nprint(1)\n~~~"
+        equation = "\\begin{align}\nx_1 &= 1\\\\\n\n x_2 &= 2\n\\end{align}"
+        blocks = convert.parse_structural_blocks(code + "\n\n" + equation, academic=True)
+        self.assertEqual([kind for _, kind in blocks], ["code_block", "paragraph", "math_block"])
+        self.assertEqual(blocks[0][0], code)
+        self.assertEqual(blocks[-1][0], equation)
+        chunks = convert.merge_blocks_to_chunks(blocks, target_size=8, academic=True)
+        self.assertEqual(sum(code in chunk for chunk in chunks), 1)
+        self.assertEqual(sum(equation in chunk for chunk in chunks), 1)
+        with self.assertRaisesRegex(ValueError, "Unclosed academic code fence"):
+            convert.parse_structural_blocks("~~~python\nprint(1)", academic=True)
+
+    def test_academic_scanner_keeps_indented_code_as_one_block(self):
+        code = "    run_eval()\n\n    print(1)"
+        blocks = convert.parse_structural_blocks(code, academic=True)
+        self.assertEqual(blocks, [(code, "code_block")])
+
+    def test_academic_markdown_import_preserves_body_whitespace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "paper.md"
+            source.write_bytes("\ufeff# Title\r\n\r\nNon-breaking\u00a0space and  full spacing.\r\n".encode("utf-8"))
+            output = Path(tmp) / "out.md"
+            details = {"transformations": [], "resource_rewrites": []}
+            self.assertTrue(convert.import_markdown_input(
+                str(source), str(output), tmp, academic=True, ingestion_details=details
+            ))
+            output_text = output.read_bytes().decode("utf-8")
+            self.assertIn("Non-breaking\u00a0space and  full spacing.", output_text)
+            self.assertIn({"kind": "leading_bom_removed", "count": 1}, details["transformations"])
+            newline_change = next(item for item in details["transformations"] if item["kind"] == "line_endings_normalized_to_lf")
+            self.assertEqual(newline_change["crlf_count"], 3)
+            self.assertEqual(details["preserved_nbsp_count"], 1)
+
+    def test_academic_import_records_front_matter_and_local_asset_hashes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source_dir = Path(tmp) / "source"
+            source_dir.mkdir()
+            asset = source_dir / "figure.png"
+            asset.write_bytes(b"synthetic-image-bytes")
+            source = source_dir / "paper.md"
+            source.write_bytes(b"---\ntitle: Sample\n---\n\n![figure](figure.png)\n")
+            details = {"transformations": [], "resource_rewrites": []}
+
+            imported = convert.import_markdown(str(source), str(Path(tmp) / "paper_temp"), academic=True,
+                                               ingestion_details=details)
+
+            self.assertTrue(any(item["kind"] == "front_matter_extracted" for item in details["transformations"]))
+            asset_record = next(item for item in details["resource_rewrites"] if item["kind"] == "local_image")
+            self.assertEqual(asset_record["sha256"], hashlib.sha256(asset.read_bytes()).hexdigest())
+            self.assertEqual(imported, "\n![figure](images/figure.png)\n")
+
+            asset.write_bytes(b"changed-image-bytes")
+            self.assertEqual(convert._changed_academic_source_resources(details), [str(asset.resolve())])
+
+    def test_academic_chunk_map_uses_exact_input_slices_and_section_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "input.md"
+            source.write_bytes(b"# Paper\n\nIntro.\n\n## Method\n\nA paragraph.\n")
+            chunks_dir = Path(tmp) / "paper_temp"
+            chunks_dir.mkdir()
+
+            filenames = convert.split_markdown_structured(str(source), str(chunks_dir), target_size=24, academic=True)
+            document_map = json.loads((chunks_dir / "document_map.json").read_text(encoding="utf-8"))
+            source_text = source.read_bytes().decode("utf-8")
+
+            self.assertEqual(document_map["coordinate_unit"], "python_unicode_codepoint")
+            self.assertEqual(document_map["range_convention"], "zero_based_left_closed_right_open")
+            self.assertEqual([chunk["source_file"] for chunk in document_map["chunks"]], filenames)
+            for chunk in document_map["chunks"]:
+                chunk_text = (chunks_dir / chunk["source_file"]).read_text(encoding="utf-8")
+                self.assertEqual(source_text[chunk["source_start"]:chunk["source_end"]], chunk_text)
+                self.assertEqual(chunk["source_sha256"], hashlib.sha256(chunk_text.encode("utf-8")).hexdigest())
+            method_block = next(block for block in document_map["blocks"] if block["kind"] == "heading" and "Method" in source_text[block["source_start"]:block["source_end"]])
+            self.assertEqual(method_block["section_path"], ["Paper", "Method"])
+            self.assertTrue(all(block["chunk_id"] for block in document_map["blocks"]))
 
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\nfake-png"

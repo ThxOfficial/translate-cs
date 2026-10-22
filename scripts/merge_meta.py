@@ -144,6 +144,10 @@ def cmd_prepare_merge(temp_dir):
     """Scan unmerged metas and propose a merge plan. Output JSON on stdout."""
     glossary_path = _glossary_path(temp_dir)
     glossary = glossary_mod.load_glossary(glossary_path)
+    if glossary.get('version') == 3:
+        import merge_meta_v3
+        print(json.dumps(merge_meta_v3.prepare(temp_dir), ensure_ascii=False, indent=2))
+        return
     applied = glossary.get('applied_meta_hashes', {})
 
     meta_paths = sorted(Path(temp_dir).glob(META_GLOB))
@@ -161,6 +165,8 @@ def cmd_prepare_merge(temp_dir):
             continue
 
         data, err = _try_load_meta(str(path))
+        if err is None and data.get('schema_version') != 1:
+            err = 'meta v2 requires an explicitly migrated glossary v3'
         if err is not None:
             sys.stderr.write(
                 f"warn: malformed meta for {chunk_id} at {path} — quarantined ({err})\n"
@@ -504,6 +510,11 @@ def cmd_apply_merge(temp_dir):
     glossary_path = _glossary_path(temp_dir)
     glossary = glossary_mod.load_glossary(glossary_path)
 
+    if glossary.get('version') == 3:
+        import merge_meta_v3
+        print(json.dumps(merge_meta_v3.apply(temp_dir, decisions_doc), ensure_ascii=False, indent=2))
+        return
+
     auto_applied = 0
     decisions_resolved = 0
     errors = []
@@ -525,6 +536,8 @@ def cmd_apply_merge(temp_dir):
             )
             continue
         data, err = _try_load_meta(meta_path)
+        if err is None and data.get('schema_version') != 1:
+            err = 'meta v2 requires an explicitly migrated glossary v3'
         if err is not None:
             errors.append(f"meta for chunk_id={chunk_id} is malformed: {err}")
             continue

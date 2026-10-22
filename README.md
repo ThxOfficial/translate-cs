@@ -1,14 +1,8 @@
-# Rainman Translate Book
+# Translate-CS
 
 English | [中文](README.zh-CN.md)
 
-An agent skill for Codex, Claude Code, and OpenClaw that translates entire books (PDF/DOCX/EPUB) into any language using parallel subagents.
-
-<p align="center">
-  <img src="assets/poster/translate-book-poster-en.jpg" alt="translate-book — a whole book, translated in parallel: split into chunks, translated by 8 parallel sub-agents, verified and merged into a complete book" width="480">
-</p>
-
-> Inspired by [claude_translater](https://github.com/wizlijun/claude_translater). The original project uses shell scripts as its entry point, coordinating the Claude CLI with multiple step scripts to perform chunked translation. This project restructures the workflow as an agent skill for Codex, Claude Code, and OpenClaw, using subagents to translate chunks in parallel, with manifest-driven integrity checks, resumable runs, and multi-format output unified into a single pipeline. As the project structure and implementation differ significantly from the original, this is an independent project rather than a fork.
+`translate-cs` is a Codex skill for translating computer science, AI, LLM, agent, and mathematical papers and books. It combines a resumable parallel translation pipeline with an evidence-based academic workflow.
 
 ---
 
@@ -29,7 +23,8 @@ Parallel subagents (8 concurrent by default)
   │  each subagent: read 1 chunk → translate → write output_chunk*.md
   │  batched to respect API rate limits
   ▼
-Validate (manifest hash check, 1:1 source↔output match)
+Validate (manifest hash check; academic mode also checks protected spans,
+          Markdown structure, and required review coverage)
   │
   ▼
 Merge → Pandoc → HTML (with TOC) → Calibre → DOCX / EPUB / PDF
@@ -47,6 +42,51 @@ Each chunk gets its own independent subagent with a fresh context window. This p
 - **Optional output controls** — explicit EPUB cover, custom temp root, and user-facing export aliases
 - **Multi-language** — zh, en, ja, ko, fr, de, es (extensible)
 - **PDF/DOCX/EPUB/Markdown input** — Calibre handles the conversion heavy lifting; formula- and table-heavy PDFs can be pre-extracted to Markdown with MinerU or Marker
+- **Academic profile** — source-checked Markdown, optional local PDF/LaTeX import, and structure-preserving translation for CS/AI/LLM/agent/math papers and books
+- **Auditable academic checks** — per-chunk context snapshots, first-occurrence term planning, deterministic structure checks, review sidecars, `quality_report.json`, and `build_report.json`
+
+## Academic Translation (Stages A, B and C)
+
+Use the academic profile for research papers and technical books in computer science, AI, LLMs, agent systems, and mathematical methods. Generic translation remains the default for other books, preserving the existing workflow and output names.
+
+The academic profile accepts inspected layout-aware Markdown, explicitly selected local PDF parsers, and bounded LaTeX projects. For DOCX/EPUB or unsupported layouts, first extract and inspect Markdown. A Markdown run starts with:
+
+```bash
+python3 scripts/convert.py paper.md --profile academic \
+  --document-kind paper --subject ai --subject llm --subject agent \
+  --olang zh --review-mode risk_based --review-sample-rate 0.1 \
+  --format md --format html
+```
+
+Academic conversion writes `ingestion.json` with the raw source fingerprint, recorded normalization and image-resource mappings, plus `document_map.json` with exact source slices, Unicode character offsets, block kinds, section paths, and hashes. Inspect `input.md` and the map for reading order, equations, tables, and image targets, then record that inspection before translating:
+
+```bash
+python3 scripts/quality.py <temp_dir> --record-input-review \
+  --findings-file <temp_dir>/drafts/input-review.json
+```
+
+The findings file must include all check names listed in `ingestion.json`; use an empty findings list only after checking each item. For Chinese, `scripts/glossary.py seed-academic` adds curated terms and sense notes without replacing hand-edited entries; its Chinese seed translations are not applied to other target languages. The translation skill masks protected content, restores it only after exact token and structure checks, and records chunk-specific glossary, neighbor, and first-occurrence context before planning resumable work.
+
+Academic review modes are `risk_based` (recorded self-checks for every chunk plus coordinator review of high-risk chunks and a reproducible 10% sample, with at least one sampled ordinary chunk), `full` (coordinator review of every chunk), and `structural_only`. The last mode always remains `needs_review`. The final quality gate also requires a current source-inspection sidecar; stale provenance, changed resources, or open review warnings block validation. A default final build requires a `validated` quality report; a user-requested intermediate draft can be built with `--allow-draft` and is marked in `build_report.json`. No stage certifies parser completeness or mathematical/semantic correctness, so inspect the extracted Markdown and generated reports.
+
+Academic output defaults to `output.md` and `book.html`. Add `--format docx`, `--format epub`, or `--format pdf` only when requested; each requested format is recorded separately in the build report. Use `--rebuild` after template or renderer changes to force regeneration of derived outputs while preserving translations, glossary entries, and review evidence. Intermediate chunks, masked tasks, review records, and quality reports are retained for audit.
+
+Stage B adds source-grounded whole-document context. Before taking task snapshots, run `python3 scripts/document_context.py <temp_dir> --prepare`, inspect its priority blocks and definition/acronym candidates, then confirm only source-supported facts using `--prepare --facts-file <facts.json>`. The file contains all four lists: `topics`, `definitions`, `abbreviations`, and `symbols`. See the [context contract](references/document-context.md) for exact evidence spans and document/section scopes. Each task receives relevant parent definitions and local symbols; ambiguous meanings remain explicit, context overflow fails visibly, and corrections invalidate only snapshots that actually used the changed fact. Existing Stage A runs without this sidecar remain compatible.
+
+The [B/C execution contract](references/advanced-academic.md) documents the implemented commands and schemas:
+
+- Explicit `glossary.py migrate-v3` preserves legacy glossaries and adds senses, section scopes, occurrence bindings, translation policies and manual locks. Meta v2 proposals use transactional merges; ambiguous sources require explicit decisions.
+- Add `--independent-review` to require a separate reviewer and execution context. `review_tasks.py` prepares packets, permits one durable repair attempt per source chunk, and limits final glossary reconciliation to two rounds. Required independent coverage remains incomplete when a separate reviewer is unavailable.
+- `convert.py paper.pdf --profile academic --pdf-parser marker` (or `mineru`) uses an installed local parser. `poppler --simple-pdf` is explicit and limited to text-only PDFs. `pdf_ingest.py --pages 3:5` produces an isolated page subset, never silently replaces the full source. No parser models are installed or documents uploaded automatically.
+- LaTeX input supports a selected main file, recursive project-confined includes, macro/BibTeX/image provenance and supported theorem/math content through Pandoc, without executing TeX. Arbitrary TeX programs, complex macro graphics and package-specific bibliography styling require inspected Markdown.
+- Academic DOCX uses native OMML; EPUB uses MathML; PDF uses installed Word on Windows or an installed Chromium engine. Successful generation requires separate visual inspection recorded by `format_review.py`; missing/stale inspection leaves the build partial. Failed native rebuilds preserve the previous artifact. Generic format behavior stays compatible.
+- Optional `academic_views.py` creates exact block-aligned bilingual Markdown/HTML and separately confirmed translator notes or image-text comparisons. `table_tasks.py` splits oversized standalone pipe tables into row groups and commits one validated canonical chunk. Complex HTML rowspan tables remain atomic. Additional mathematical review rules cover linear algebra, probability, optimization and logic.
+
+Validation on 2026-10-22: 320 stdlib tests passed, plus real Pandoc HTML checks, real Poppler full/subset and recursive LaTeX checks, and a five-chunk model translation/independent-review/repair demonstration. Actual Pandoc 3.9 DOCX/EPUB and Word 16 PDF samples were generated and visually checked, including five math expressions, Chinese, a table and a footnote; EPUB spine navigation was checked in the in-app Chromium reader. This is a synthetic workflow demonstration, not an accuracy benchmark or certification of every reader. Marker/MinerU models were not installed, so those adapters have invocation-contract tests only. A final repeat of the native-format integration command requiring hidden Word was declined; previous real-rendering evidence and current unit tests are retained. Generated evidence stays under ignored `tests/.artifacts/`.
+
+Academic HTML explicitly enables dollar and backslash-delimited math and records structured Pandoc diagnostics in `output.html.pandoc.json`. Unsupported math blocks completion even when Pandoc exits successfully; unrelated localization warnings are retained for inspection. The opt-in real-engine check is `python3 tests/integration/check_academic_html.py` with Pandoc on PATH. It checks MathML for fractions, roots, matrices, subscripts/superscripts, and a failed unsupported macro; it does not validate EPUB/PDF appearance or semantic accuracy.
+
+Run `python3 tests/integration/check_document_context.py` for the context/planner CLI smoke test. It keeps generated artifacts under `tests/.artifacts/academic-stageB1/`, labels source-copy outputs as pipeline mocks, and verifies that a late definition correction replans 2 of 12 chunks. This check is independent of Pandoc and is not a translation-quality benchmark.
 
 ## Prerequisites
 
@@ -64,37 +104,39 @@ Each chunk gets its own independent subagent with a fresh context window. This p
 
 #### Codex
 
-```bash
-npx skills add deusyu/translate-book -a codex -g
-```
-
-Or install it manually:
+Install the GitHub repository in Codex's personal skill directory:
 
 ```bash
 mkdir -p ~/.agents/skills
-git clone https://github.com/deusyu/translate-book.git ~/.agents/skills/translate-book
+git clone https://github.com/ThxOfficial/translate-cs.git ~/.agents/skills/translate-cs
 ```
 
-Restart Codex if the newly installed skill does not appear.
+In Windows PowerShell, use:
+
+```powershell
+$target = Join-Path $HOME ".agents\skills\translate-cs"
+New-Item -ItemType Directory -Force -Path (Split-Path $target) | Out-Null
+git clone https://github.com/ThxOfficial/translate-cs.git $target
+```
+
+Codex discovers skills from `~/.agents/skills`. Run `/skills` to view available skills or invoke this one explicitly with `$translate-cs`. Codex detects skill changes automatically; restart only if it does not appear.
 
 #### Claude Code
 
 ```bash
-npx skills add deusyu/translate-book -a claude-code -g
+npx skills add ThxOfficial/translate-cs -a claude-code -g
 ```
 
 Or install it manually:
 
 ```bash
 mkdir -p ~/.claude/skills
-git clone https://github.com/deusyu/translate-book.git ~/.claude/skills/translate-book
+git clone https://github.com/ThxOfficial/translate-cs.git ~/.claude/skills/translate-cs
 ```
 
 #### OpenClaw
 
-```bash
-openclaw skills install @deusyu/translate-book
-```
+For OpenClaw, follow the local skill-directory instructions for the installed runtime.
 
 ### 2. Translate a book
 
@@ -103,7 +145,7 @@ openclaw skills install @deusyu/translate-book
 In the Codex CLI or IDE extension, enter:
 
 ```text
-$translate-book Translate /path/to/book.pdf into Chinese.
+$translate-cs Translate /path/to/paper.pdf into Chinese, preserving formulas, terminology, and citation structure.
 ```
 
 Codex can also select the skill automatically when your request matches its description.
@@ -119,10 +161,10 @@ translate /path/to/book.pdf to Chinese
 In Claude Code, you can also use the slash command:
 
 ```text
-/translate-book translate /path/to/book.pdf to Japanese
+/translate-cs translate /path/to/book.pdf to Japanese
 ```
 
-The skill handles the full pipeline automatically — convert, chunk, translate in parallel, validate, merge, and build all output formats.
+The skill handles the pipeline — convert, chunk, translate in parallel, validate, merge, and build the requested output formats.
 
 ### 3. Find your outputs
 
@@ -152,6 +194,21 @@ python3 ../../scripts/convert.py ../baselines/standard-alice/standard-alice.epub
 python3 ../../scripts/merge_and_build.py --temp-dir standard-alice_temp --title "test"
 ```
 
+## Push to GitHub
+
+The configured `origin` is `https://github.com/ThxOfficial/translate-cs.git` and the working branch is `main`. Review the files before staging and committing:
+
+```bash
+git status --short --branch
+git add -A
+git diff --cached --check
+git diff --cached --stat
+git commit -m "feat: specialize translate-cs for academic translation"
+git push origin main
+```
+
+`git add -A` stages every tracked modification and untracked project file, so inspect the staged summary before committing. Pushing `main` updates the repository; a tagged GitHub release is a separate action.
+
 ## Feedback and Contributions
 
 Please open a detailed GitHub issue instead of starting with a pull request. This project is maintained as an AI-assisted skill pipeline, and changes need to be evaluated against the current orchestration rules, chunk/manifest contracts, baseline assets, and release flow in one maintainer-owned context.
@@ -167,19 +224,7 @@ A useful issue should include:
 
 ## Contact
 
-For bugs and feature requests, please open a [GitHub issue](https://github.com/deusyu/translate-book/issues) as described above. For questions, ideas, or anything else, you can reach me here:
-
-| Channel | Link |
-|---------|------|
-| X (Twitter) | [@0xdeusyu](https://x.com/0xdeusyu) |
-| Telegram | [@DeusThink](https://t.me/DeusThink) |
-| Telegram Group (Chinese) | [@talkdeusyu](https://t.me/talkdeusyu) |
-| Telegram Channel (Chinese) | [@lovedesuyu](https://t.me/lovedesuyu) |
-| Email | [rainman.deus@gmail.com](mailto:rainman.deus@gmail.com) |
-
-For commercial sponsorship, see [Commercial sponsorship](#commercial-sponsorship) below.
-
-The channel is my running log of thinking alongside AI; the group is its discussion space, and translate-book questions are welcome there too.
+For bugs and feature requests, open an issue in [ThxOfficial/translate-cs](https://github.com/ThxOfficial/translate-cs/issues).
 
 ## Pipeline Details
 
@@ -304,12 +349,14 @@ Then: merge → Pandoc HTML → inject TOC → Calibre generates DOCX, EPUB, PDF
 | Changed title/template/assets but output didn't update | Delete existing `output.md`, `book*.html`, `book.docx`, `book.epub`, `book.pdf` from the temp dir, then re-run `merge_and_build.py` |
 | Want page-number footers stripped from PDF output | By default, monotonic page-number sequences (e.g. `1, 2, 3, ...`) are auto-detected and dropped while outliers like years (`1984`), chapter numbers, and citation indices stay preserved. If detection misses your case, pass `--strip-page-numbers` to `convert.py` to aggressively delete every standalone-digit line. The flag aborts if a cached `input.md` or `chunk*.md` already exists — delete them first so the flag actually takes effect. |
 | `output.md exists but manifest invalid` | Stale output — the script auto-deletes and re-merges |
-| `Glossary upgrade rejected: duplicate source` | v2 disallows two terms sharing a source/alias surface form. Edit `glossary.json` to disambiguate (e.g., rename one source from `Apple` to `Apple (Inc.)`) and reload. |
+| `Glossary upgrade rejected: duplicate source` | The legacy v2 glossary requires unique surfaces. For academic work, migrate explicitly to v3 with `python3 scripts/glossary.py migrate-v3 <temp_dir>`; v3 supports polysemy through reviewed occurrence bindings. |
 | PDF generation fails | Ensure Calibre is installed with PDF output support |
 
-## Roadmap
+## Generic Pipeline Capabilities
 
-Tracking [issue #7](https://github.com/deusyu/translate-book/issues/7) — name/term inconsistency and pronoun/gender errors across chunks. The pipeline now covers high-frequency entities, alias/spelling drift, adjacent-chunk pronoun context, and selective re-translation after glossary changes. Full-book organic validation remains a future quality pass. The plan is four independently shippable phases.
+These capabilities remain available alongside the academic profile. See [academic delivery status](docs/CS_AI_TRANSLATION_SPEC.md#135-当前尚未完成的验收和发布工作) for remaining validation items.
+
+The generic pipeline supports scoped terminology, source-grounded context, and selective re-translation. Validation on a complete, naturally translated technical book remains unfinished.
 
 ### Design principles
 
@@ -336,34 +383,24 @@ Phase 1 grows the glossary batch-by-batch, so the first batch sees the smallest 
 
 > Phase 4 remains gated on real-book evidence. The shipped schemas can still evolve under compatibility-aware migrations if production runs expose gaps.
 
-### Parallel track — Pipeline / UX backlog (partly shipped, separate from issue #7)
+### Pipeline / UX capabilities (partly shipped)
 
 Recent PR discussions also surfaced several useful workflow improvements, but these are broader than one-off patches and touch repo contracts (artifact names, temp-dir behavior, cleanup semantics, or EPUB compatibility scope). Current status:
 
-- **Explicit EPUB cover support (shipped).** `merge_and_build.py --cover <image>` passes the image through the HTML -> EPUB Calibre step. `--cover-from <epub>` / EPUB cover auto-extraction remains out of scope until the project is ready to own EPUB parsing compatibility across different package layouts. (context: closed #3)
-- **Configurable temp workspace location (shipped).** `convert.py --temp-root <dir>` keeps the default cwd-local `{book_name}_temp/` behavior unless explicitly overridden. (context: closed #4)
-- **Safer Calibre/Pandoc artifact cleanup (partly shipped).** Page-number and Calibre-marker cleanup is regression-tested, preserving years, chapter numbers, and non-monotonic standalone numbers. Continue improving cleanup incrementally under tests. (context: closed #5)
-- **Optional user-facing export names (shipped).** `merge_and_build.py --export-name <stem>` creates alias copies while preserving canonical pipeline artifacts as `book.html`, `book_doc.html`, `book.docx`, `book.epub`, and `book.pdf`. (context: closed #6)
+- **Explicit EPUB cover support (shipped).** `merge_and_build.py --cover <image>` passes the image through the HTML -> EPUB Calibre step. `--cover-from <epub>` / EPUB cover auto-extraction remains out of scope until the project is ready to own EPUB parsing compatibility across different package layouts.
+- **Configurable temp workspace location (shipped).** `convert.py --temp-root <dir>` keeps the default cwd-local `{book_name}_temp/` behavior unless explicitly overridden.
+- **Safer Calibre/Pandoc artifact cleanup (partly shipped).** Page-number and Calibre-marker cleanup is regression-tested, preserving years, chapter numbers, and non-monotonic standalone numbers. Continue improving cleanup incrementally under tests.
+- **Optional user-facing export names (shipped).** `merge_and_build.py --export-name <stem>` creates alias copies while preserving canonical pipeline artifacts as `book.html`, `book_doc.html`, `book.docx`, `book.epub`, and `book.pdf`.
 
 ## Star History
 
 If you find this project helpful, please consider giving it a Star ⭐!
 
-[![Star History Chart](https://api.star-history.com/svg?repos=deusyu/translate-book&type=Date)](https://star-history.com/#deusyu/translate-book&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=ThxOfficial/translate-cs&type=Date)](https://star-history.com/#ThxOfficial/translate-cs&Date)
 
-## Sponsor
+## Model execution
 
-If this project saves you time, consider sponsoring to keep it maintained and improved.
-
-[![Sponsor](https://img.shields.io/github/sponsors/deusyu?label=Sponsor&logo=github)](https://github.com/sponsors/deusyu)
-
-### Commercial sponsorship
-
-Companies are welcome to sponsor translate-book, and terms are open to discussion. Email [rainman.deus@gmail.com](mailto:rainman.deus@gmail.com).
-
-Not accepted:
-
-- Setup guides, base URLs, or environment variables for third-party model platforms or API relays in the README or docs. translate-book does not call any model API itself; translation runs inside the user's own agent host (Codex, Claude Code, OpenClaw).
+`translate-cs` does not call a model API. Translation and review run through the user's own agent host, such as Codex, Claude Code, or OpenClaw.
 
 ## License
 

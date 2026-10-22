@@ -24,6 +24,7 @@ import hashlib
 import json
 import re
 import urllib.parse
+from pathlib import Path
 
 from manifest import create_manifest, file_hash
 
@@ -573,7 +574,7 @@ def markdown_metadata(content):
     return metadata
 
 
-def import_markdown(md_path, temp_dir):
+def import_markdown(md_path, temp_dir, academic=False, ingestion_details=None):
     """Return Markdown content ready for chunking, with images moved under temp_dir/images/.
 
     Relative image paths are resolved against the Markdown file's directory
@@ -582,16 +583,43 @@ def import_markdown(md_path, temp_dir):
     payloads. Remote URLs stay untouched. YAML front matter is dropped from
     the body — its metadata goes to config.txt via markdown_metadata().
     """
-    with open(md_path, 'r', encoding='utf-8') as f:
+    with open(md_path, 'r', encoding='utf-8', newline='' if academic else None) as f:
         content = f.read()
-    content = content.replace('﻿', '').replace(' ', ' ')
-    _, content = split_front_matter(content)
+    if academic:
+        transformations = []
+        if content.startswith('\ufeff'):
+            content = content[1:]
+            transformations.append({"kind": "leading_bom_removed", "count": 1})
+        crlf_count = content.count('\r\n')
+        bare_cr_count = content.count('\r') - crlf_count
+        if crlf_count or bare_cr_count:
+            content = content.replace('\r\n', '\n').replace('\r', '\n')
+            transformations.append({
+                "kind": "line_endings_normalized_to_lf",
+                "crlf_count": crlf_count,
+                "bare_cr_count": bare_cr_count,
+            })
+        if ingestion_details is not None:
+            ingestion_details.setdefault("transformations", []).extend(transformations)
+            ingestion_details["preserved_nbsp_count"] = content.count('\xa0')
+    else:
+        # Keep generic-profile behavior for existing users.
+        content = content.replace('\ufeff', '').replace('\xa0', ' ')
+    before_front_matter = content
+    metadata, content = split_front_matter(content)
+    if academic and ingestion_details is not None and content != before_front_matter:
+        ingestion_details.setdefault("transformations", []).append({
+            "kind": "front_matter_extracted",
+            "metadata_keys": sorted(metadata),
+            "source_sha256": hashlib.sha256((before_front_matter[:len(before_front_matter) - len(content)]).encode('utf-8')).hexdigest(),
+        })
 
     md_dir = os.path.dirname(os.path.abspath(md_path))
     images_dir = os.path.join(temp_dir, "images")
     refs = {}
     stored = {}
     embedded_count = 0
+    resource_rewrites = []
 
     def store(name, data):
         base, ext = os.path.splitext(name)
@@ -624,15 +652,51 @@ def import_markdown(md_path, temp_dir):
                 ext = _DATA_URI_EXTENSIONS.get(subtype, '.' + re.sub(r'[^a-z0-9]', '', subtype))
                 embedded_count += 1
                 new_ref = store(f"embedded-{embedded_count:04d}{ext}", data)
+                resource_rewrites.append({
+                    "kind": "embedded_image",
+                    "source_reference_sha256": hashlib.sha256(raw.encode('utf-8')).hexdigest(),
+                    "localized_reference": new_ref,
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                    "size_bytes": len(data),
+                })
             else:
                 print("Warning: could not decode an embedded data-URI image; left inline")
         elif not _URI_SCHEME_RE.match(raw) and not raw.startswith('#'):
             src = os.path.normpath(os.path.join(md_dir, urllib.parse.unquote(raw)))
             if os.path.isfile(src):
                 with open(src, 'rb') as f:
-                    new_ref = store(os.path.basename(src), f.read())
+                    data = f.read()
+                new_ref = store(os.path.basename(src), data)
+                resource_rewrites.append({
+                    "kind": "local_image",
+                    "source_path": os.path.realpath(src),
+                    "source_reference": raw,
+                    "localized_reference": new_ref,
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                    "size_bytes": len(data),
+                })
             else:
                 print(f"Warning: image not found next to the Markdown file, reference kept as-is: {raw}")
+                resource_rewrites.append({
+                    "kind": "missing_local_image",
+                    "source_reference": raw,
+                    "localized_reference": raw,
+                    "status": "unresolved",
+                })
+        elif _URI_SCHEME_RE.match(raw):
+            resource_rewrites.append({
+                "kind": "external_image",
+                "source_reference": raw,
+                "localized_reference": raw,
+                "status": "not_fetched",
+            })
+        else:
+            resource_rewrites.append({
+                "kind": "fragment_image",
+                "source_reference": raw,
+                "localized_reference": raw,
+                "status": "preserved",
+            })
         refs[raw] = new_ref
         return new_ref
 
@@ -643,17 +707,19 @@ def import_markdown(md_path, temp_dir):
 
     if stored:
         print(f"Localized {len(stored)} image(s) into {images_dir}/")
+    if academic and ingestion_details is not None:
+        ingestion_details["resource_rewrites"] = resource_rewrites
     return content
 
 
-def import_markdown_input(input_file, input_md, temp_dir):
+def import_markdown_input(input_file, input_md, temp_dir, academic=False, ingestion_details=None):
     """Copy a Markdown source into temp_dir/input.md with its images localized."""
     os.makedirs(temp_dir, exist_ok=True)
-    content = import_markdown(input_file, temp_dir)
+    content = import_markdown(input_file, temp_dir, academic=academic, ingestion_details=ingestion_details)
     if not content.strip():
         print(f"Error: {input_file} has no content to translate")
         return False
-    with open(input_md, 'w', encoding='utf-8') as f:
+    with open(input_md, 'w', encoding='utf-8', newline='\n' if academic else None) as f:
         f.write(content)
     print(f"Markdown import successful: {input_md}")
     return True
@@ -663,7 +729,41 @@ def import_markdown_input(input_file, input_md, temp_dir):
 # Structural block parsing and chunk splitting (Step 3)
 # =============================================================================
 
-def parse_structural_blocks(content):
+_ACADEMIC_ENV_OPEN_RE = re.compile(r'^ {0,3}\\begin\{(equation\*?|align\*?|gather\*?|multline\*?|cases|aligned|split)\}')
+
+
+def _academic_math_block_end(lines, start_index):
+    """Return (end_line, kind) for a display equation starting on this line."""
+    line = lines[start_index].strip()
+    if line.startswith("$$"):
+        if re.search(r'(?<!\\)\$\$.*(?<!\\)\$\$', line):
+            return start_index, "math_block"
+        for index in range(start_index + 1, len(lines)):
+            if re.search(r'(?<!\\)\$\$', lines[index]):
+                return index, "math_block"
+        raise ValueError(f"Unclosed academic $$ display math starting at line {start_index + 1}")
+    if line.startswith(r"\["):
+        if re.search(r'(?<!\\)\\\]', line):
+            return start_index, "math_block"
+        for index in range(start_index + 1, len(lines)):
+            if re.search(r'(?<!\\)\\\]', lines[index]):
+                return index, "math_block"
+        raise ValueError(f"Unclosed academic \\[ display math starting at line {start_index + 1}")
+    environment = _ACADEMIC_ENV_OPEN_RE.match(lines[start_index])
+    if environment:
+        name = environment.group(1)
+        closing = re.compile(rf'\\end\{{{re.escape(name)}\}}')
+        depth = 1
+        for index in range(start_index + 1, len(lines)):
+            depth += len(re.findall(rf'\\begin\{{{re.escape(name)}\}}', lines[index]))
+            depth -= len(closing.findall(lines[index]))
+            if depth == 0:
+                return index, "math_block"
+        raise ValueError(f"Unclosed academic LaTeX environment {name!r} starting at line {start_index + 1}")
+    return None
+
+
+def parse_structural_blocks(content, academic=False):
     """Parse markdown into structural blocks that should not be split.
 
     Returns list of (text, block_type) tuples where block_type is one of:
@@ -677,24 +777,60 @@ def parse_structural_blocks(content):
         line = lines[i]
         stripped = line.strip()
 
-        # Code block (fenced)
-        if stripped.startswith('```'):
+        # Fenced code block. Academic mode also recognizes tilde fences and
+        # requires a real close so a damaged fence cannot be split as prose.
+        fence_open = re.match(r'^ {0,3}(`{3,}|~{3,})', line)
+        if fence_open:
+            marker = fence_open.group(1)[0]
+            fence_width = len(fence_open.group(1))
             block_lines = [line]
             i += 1
+            closed = False
             while i < len(lines):
                 block_lines.append(lines[i])
-                if lines[i].strip().startswith('```') and len(block_lines) > 1:
+                if re.match(rf'^ {{0,3}}{re.escape(marker)}{{{fence_width},}}[ \t]*$', lines[i]):
                     i += 1
+                    closed = True
                     break
                 i += 1
+            if academic and not closed:
+                raise ValueError(f"Unclosed academic code fence starting at line {i - len(block_lines) + 1}")
             blocks.append(('\n'.join(block_lines), 'code_block'))
             continue
+
+        if academic:
+            math_end = _academic_math_block_end(lines, i)
+            if math_end:
+                end, kind = math_end
+                blocks.append(('\n'.join(lines[i:end + 1]), kind))
+                i = end + 1
+                continue
+
+            if line.startswith("    ") or line.startswith("\t"):
+                end = i + 1
+                while end < len(lines):
+                    if lines[end].startswith("    ") or lines[end].startswith("\t"):
+                        end += 1
+                        continue
+                    if lines[end].strip() == "":
+                        lookahead = end
+                        while lookahead < len(lines) and lines[lookahead].strip() == "":
+                            lookahead += 1
+                        if lookahead < len(lines) and (lines[lookahead].startswith("    ") or lines[lookahead].startswith("\t")):
+                            end = lookahead
+                            continue
+                    break
+                blocks.append(('\n'.join(lines[i:end]), 'code_block'))
+                i = end
+                continue
 
         # Display math ($$ ... $$). Lines inside may look like list items or
         # tables, so the block must be kept whole. Like pandoc, never pair
         # delimiters across a blank line — an unclosed $$ must not swallow
         # the rest of the chapter.
         if stripped.startswith('$$'):
+            if academic:
+                raise ValueError(f"Unclosed academic $$ display math starting at line {i + 1}")
             if len(stripped) >= 4 and stripped.endswith('$$'):
                 blocks.append((line, 'math_block'))
                 i += 1
@@ -781,7 +917,10 @@ def parse_structural_blocks(content):
         i += 1
         while i < len(lines):
             s = lines[i].strip()
-            if (s == '' or s.startswith('```') or s.startswith('$$') or re.match(r'^#{1,6}\s', s) or
+            if (s == '' or re.match(r'^ {0,3}(?:`{3,}|~{3,})', lines[i]) or s.startswith('$$') or re.match(r'^#{1,6}\s', s) or
+                    (academic and _ACADEMIC_ENV_OPEN_RE.match(lines[i])) or
+                    (academic and s.startswith(r"\[")) or
+                    (academic and (lines[i].startswith("    ") or lines[i].startswith("\t"))) or
                     s.startswith('>') or s.startswith('|') or
                     re.match(r'^[-*+]\s', s) or re.match(r'^\d+\.\s', s) or
                     re.match(r'!\[', s)):
@@ -794,7 +933,124 @@ def parse_structural_blocks(content):
     return blocks
 
 
-def merge_blocks_to_chunks(blocks, target_size=6000):
+def _structural_blocks_with_offsets(content, academic=True):
+    """Pair the bounded scanner's blocks with exact Unicode offsets in input.md."""
+    lines = content.split('\n')
+    line_starts = []
+    offset = 0
+    for line in lines:
+        line_starts.append(offset)
+        offset += len(line) + 1
+
+    records = []
+    line_index = 0
+    for block_index, (text, block_type) in enumerate(parse_structural_blocks(content, academic=academic), 1):
+        line_count = text.count('\n') + 1
+        last_line = line_index + line_count - 1
+        if last_line >= len(lines) or '\n'.join(lines[line_index:last_line + 1]) != text:
+            raise ValueError(f"Could not map structural block {block_index} back to input.md")
+        start = line_starts[line_index]
+        end = line_starts[last_line] + len(lines[last_line])
+        records.append({
+            "block_id": f"block{block_index:06d}",
+            "kind": block_type,
+            "source_start": start,
+            "source_end": end,
+            "source_text": text,
+        })
+        line_index = last_line + 1
+
+    if line_index != len(lines):
+        raise ValueError("Structural scanner did not account for every input.md line")
+    return records
+
+
+def _write_document_map(temp_dir, input_md, chunk_files, block_groups=None):
+    """Write a source-slice map for academic Markdown chunks."""
+    with open(input_md, 'r', encoding='utf-8', newline='') as handle:
+        content = handle.read()
+    block_records = _structural_blocks_with_offsets(content, academic=True)
+
+    chunks = []
+    cursor = 0
+    for order, filename in enumerate(chunk_files, 1):
+        path = os.path.join(temp_dir, filename)
+        with open(path, 'r', encoding='utf-8', newline='') as handle:
+            chunk_text = handle.read()
+        start = content.find(chunk_text, cursor) if chunk_text else cursor
+        if start < 0:
+            raise ValueError(f"Academic chunk is not an exact source slice: {filename}")
+        end = start + len(chunk_text)
+        if content[start:end] != chunk_text:
+            raise ValueError(f"Academic chunk does not match its source slice: {filename}")
+        chunks.append({
+            "id": os.path.splitext(filename)[0],
+            "order": order,
+            "source_file": filename,
+            "source_start": start,
+            "source_end": end,
+            "source_sha256": file_hash(path),
+            "block_ids": [],
+        })
+        cursor = end
+
+    block_to_chunk = {}
+    if block_groups is not None:
+        if len(block_groups) != len(chunks):
+            raise ValueError("Academic chunk/block group count mismatch")
+        for chunk, group in zip(chunks, block_groups):
+            for block_index in group:
+                block_to_chunk[block_index] = chunk["id"]
+    else:
+        for block_index, block in enumerate(block_records):
+            for chunk in chunks:
+                if chunk["source_start"] <= block["source_start"] and block["source_end"] <= chunk["source_end"]:
+                    block_to_chunk[block_index] = chunk["id"]
+                    break
+
+    heading_stack = []
+    mapped_blocks = []
+    for index, block in enumerate(block_records):
+        chunk_id = block_to_chunk.get(index)
+        heading = re.match(r'^ {0,3}(#{1,6})\s+(.*)$', block["source_text"])
+        if heading:
+            level = len(heading.group(1))
+            title = re.sub(r'\s*\{[^}]*\}\s*$', '', heading.group(2)).strip()
+            heading_stack = [item for item in heading_stack if item["level"] < level]
+            heading_stack.append({"level": level, "title": title})
+        if chunk_id is not None:
+            next(chunk for chunk in chunks if chunk["id"] == chunk_id)["block_ids"].append(block["block_id"])
+        mapped_blocks.append({
+            "block_id": block["block_id"],
+            "kind": block["kind"],
+            "section_path": [item["title"] for item in heading_stack],
+            "source_start": block["source_start"],
+            "source_end": block["source_end"],
+            "source_sha256": hashlib.sha256(block["source_text"].encode('utf-8')).hexdigest(),
+            "chunk_id": chunk_id,
+            "page": None,
+        })
+
+    payload = {
+        "schema_version": 1,
+        "source_file": os.path.basename(input_md),
+        "source_sha256": file_hash(input_md),
+        "coordinate_unit": "python_unicode_codepoint",
+        "range_convention": "zero_based_left_closed_right_open",
+        "parser": "translate-cs-bounded-markdown-v1",
+        "chunks": chunks,
+        "blocks": mapped_blocks,
+    }
+    path = os.path.join(temp_dir, "document_map.json")
+    temp_path = path + ".tmp"
+    with open(temp_path, 'w', encoding='utf-8', newline='\n') as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write('\n')
+    os.replace(temp_path, path)
+    return payload
+
+
+def merge_blocks_to_chunks(blocks, target_size=6000, academic=False, return_groups=False):
     """Merge structural blocks into chunks respecting target_size.
 
     Prefers to split at heading boundaries. Never splits within a single
@@ -803,20 +1059,30 @@ def merge_blocks_to_chunks(blocks, target_size=6000):
     chunks = []
     current_parts = []
     current_size = 0
+    current_indices = []
+    chunk_groups = []
 
     def flush():
-        nonlocal current_parts, current_size
+        nonlocal current_parts, current_size, current_indices
         if current_parts:
             chunks.append('\n'.join(current_parts))
+            chunk_groups.append(current_indices)
             current_parts = []
             current_size = 0
+            current_indices = []
 
-    for text, btype in blocks:
+    for block_index, (text, btype) in enumerate(blocks):
         block_size = len(text)
 
-        # If a single block is oversized, handle degradation
+        # Generic mode retains historical behavior. Academic mode preserves
+        # oversized structural blocks instead of breaking formulas or code.
         if block_size > target_size * 2:
             flush()
+            if academic:
+                print(f"  WARNING: Oversized {btype} block ({block_size} chars), preserving as one academic chunk")
+                chunks.append(text)
+                chunk_groups.append([block_index])
+                continue
             print(f"  WARNING: Oversized {btype} block ({block_size} chars), force-splitting")
             sub_chunks = _force_split_block(text, target_size)
             chunks.extend(sub_chunks)
@@ -831,10 +1097,11 @@ def merge_blocks_to_chunks(blocks, target_size=6000):
             flush()
 
         current_parts.append(text)
+        current_indices.append(block_index)
         current_size += block_size
 
     flush()
-    return chunks
+    return (chunks, chunk_groups) if return_groups else chunks
 
 
 def _force_split_block(text, target_size):
@@ -906,25 +1173,42 @@ def _force_split_block(text, target_size):
     return chunks
 
 
-def split_markdown_structured(md_file, temp_dir, target_size=6000):
+def split_markdown_structured(md_file, temp_dir, target_size=6000, academic=False):
     """Split markdown into structural chunks.
 
     Returns list of chunk filenames (e.g. ['chunk0001.md', ...]).
     """
     try:
-        with open(md_file, 'r', encoding='utf-8') as f:
+        with open(md_file, 'r', encoding='utf-8', newline='' if academic else None) as f:
             content = f.read()
 
-        blocks = parse_structural_blocks(content)
-        chunk_texts = merge_blocks_to_chunks(blocks, target_size)
+        blocks = parse_structural_blocks(content, academic=academic)
+        block_groups = None
+        if academic:
+            block_records = _structural_blocks_with_offsets(content, academic=True)
+            chunk_texts, block_groups = merge_blocks_to_chunks(
+                blocks, target_size, academic=True, return_groups=True
+            )
+            source_slices = [
+                content[block_records[group[0]]["source_start"]:block_records[group[-1]]["source_end"]]
+                for group in block_groups
+            ]
+            if source_slices != chunk_texts:
+                raise ValueError("Academic chunker output is not an exact input.md source slice")
+            chunk_texts = source_slices
+        else:
+            chunk_texts = merge_blocks_to_chunks(blocks, target_size, academic=False)
 
         chunk_files = []
         for i, chunk_text in enumerate(chunk_texts, 1):
             filename = f"chunk{i:04d}.md"
             chunk_file = os.path.join(temp_dir, filename)
-            with open(chunk_file, 'w', encoding='utf-8') as f:
+            with open(chunk_file, 'w', encoding='utf-8', newline='\n' if academic else None) as f:
                 f.write(chunk_text)
             chunk_files.append(filename)
+
+        if academic:
+            _write_document_map(temp_dir, md_file, chunk_files, block_groups=block_groups)
 
         print(f"Split into {len(chunk_files)} chunks")
         for filename in chunk_files:
@@ -978,16 +1262,204 @@ conversion_method={conversion_method}
         return False
 
 
-def _do_split_and_manifest(temp_dir, input_md, chunk_size):
+TRANSLATION_SPEC_VERSION = 1
+
+
+def _load_translation_spec(temp_dir):
+    path = os.path.join(temp_dir, "translation_spec.json")
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as handle:
+        spec = json.load(handle)
+    if not isinstance(spec, dict) or spec.get("schema_version") != TRANSLATION_SPEC_VERSION:
+        raise ValueError(f"Unsupported translation spec: {path}")
+    return spec
+
+
+def _translation_prompt_hash(profile):
+    if profile != "academic":
+        return ""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    prompt_files = ("SKILL.md", os.path.join("references", "academic-translation.md"),
+                    os.path.join("references", "document-context.md"),
+                    os.path.join("references", "advanced-academic.md"), os.path.join("references", "math-domains.md"))
+    digest = hashlib.sha256()
+    for relative_path in prompt_files:
+        path = os.path.join(root, relative_path)
+        if not os.path.isfile(path):
+            raise ValueError(f"Academic translation instructions are missing: {path}")
+        with open(path, "rb") as handle:
+            digest.update(relative_path.encode("utf-8") + b"\0" + handle.read())
+    return digest.hexdigest()
+
+
+def _resolve_translation_settings(args, temp_dir):
+    existing = _load_translation_spec(temp_dir)
+    profile = args.profile or (existing or {}).get("profile") or "generic"
+    if profile not in ("generic", "academic"):
+        raise ValueError(f"Unsupported translation profile: {profile}")
+    settings = {
+        "profile": profile,
+        "document_kind": args.document_kind or (existing or {}).get("document_kind", "auto"),
+        "subjects": args.subjects if args.subjects is not None else (existing or {}).get("subjects", []),
+        "source_lang": args.ilang or (existing or {}).get("source_lang", "auto"),
+        "target_lang": args.olang or (existing or {}).get("target_lang", "zh"),
+        "style": "faithful",
+        "term_display": "first_occurrence_bilingual",
+        "code_policy": "verbatim",
+        "prompt_example_policy": "verbatim",
+        "bibliography_policy": "verbatim",
+        "translator_notes": "separate",
+        "review_mode": args.review_mode or (existing or {}).get("review_mode", "risk_based"),
+        "review_sample_rate": args.review_sample_rate if args.review_sample_rate is not None else (existing or {}).get("review_sample_rate", 0.1),
+        "review_policy_version": "academic-review-v1" if profile == "academic" else "legacy-v1",
+        "requested_formats": args.requested_formats or (existing or {}).get("requested_formats", ["md", "html"]),
+        "keep_intermediates": True,
+        "custom_instructions": args.custom_instructions if args.custom_instructions is not None else (existing or {}).get("custom_instructions", ""),
+        "translation_prompt_sha256": _translation_prompt_hash(profile),
+        "chunk_size": args.chunk_size if args.chunk_size is not None else ((existing or {}).get("chunk_size") or 6000),
+        "chunking_version": "academic-v1" if profile == "academic" else "generic-v1",
+        "translation_prompt_version": "academic-v2" if profile == "academic" else "generic-v1",
+        "protection_version": "content-guard-v2" if profile == "academic" else "none",
+    }
+    if settings["document_kind"] not in ("auto", "paper", "book"):
+        raise ValueError("--document-kind must be auto, paper, or book")
+    if getattr(args, 'independent_review', False) or (existing or {}).get('require_independent_review', False):
+        settings['require_independent_review'] = True
+        settings['review_policy_version'] = 'academic-review-v2'
+    if settings["review_mode"] not in ("risk_based", "full", "structural_only"):
+        raise ValueError("--review-mode must be risk_based, full, or structural_only")
+    if isinstance(settings["chunk_size"], bool) or not isinstance(settings["chunk_size"], int) or settings["chunk_size"] <= 0:
+        raise ValueError("--chunk-size must be a positive integer")
+    if isinstance(settings["review_sample_rate"], bool) or not isinstance(settings["review_sample_rate"], (int, float)) or not 0 < settings["review_sample_rate"] <= 1:
+        raise ValueError("--review-sample-rate must be greater than 0 and at most 1")
+    if not isinstance(settings["subjects"], list) or not all(isinstance(value, str) for value in settings["subjects"]):
+        raise ValueError("subjects must be a list of strings")
+    if profile == "academic":
+        normalized_subjects = [value.strip().lower() for value in settings["subjects"]]
+        allowed_subjects = {"cs", "ai", "llm", "agent", "math"}
+        unsupported_subjects = [value for value in normalized_subjects if value not in allowed_subjects]
+        if unsupported_subjects:
+            raise ValueError("Unsupported academic subject(s): " + ", ".join(unsupported_subjects))
+        settings["subjects"] = list(dict.fromkeys(normalized_subjects))
+    if not isinstance(settings["requested_formats"], list):
+        raise ValueError("requested_formats must be a list")
+    if not settings["requested_formats"] or any(value not in ("md", "html", "docx", "epub", "pdf") for value in settings["requested_formats"]):
+        raise ValueError("requested_formats must contain one or more supported formats")
+    if len(settings["requested_formats"]) != len(set(settings["requested_formats"])):
+        raise ValueError("requested_formats must not contain duplicates")
+    return settings
+
+
+def _check_chunking_cache(temp_dir, settings):
+    """Reject settings changes that would silently reuse incompatible chunks."""
+    if not _find_existing_chunk_files(temp_dir):
+        return
+    old_spec = _load_translation_spec(temp_dir)
+    if old_spec is None:
+        if settings["profile"] == "academic":
+            raise ValueError(
+                "Academic profile cannot reuse legacy chunks without chunking metadata. "
+                "Use a fresh --temp-root to preserve the existing run."
+            )
+        return
+    changed = [
+        key for key in ("chunking_version", "chunk_size")
+        if old_spec.get(key) != settings.get(key)
+    ]
+    if changed:
+        raise ValueError(
+            "Chunking settings changed for a cached run (" + ", ".join(changed) +
+            "). Use a fresh --temp-root so existing outputs remain recoverable."
+        )
+
+
+def _write_translation_spec(temp_dir, settings):
+    path = os.path.join(temp_dir, "translation_spec.json")
+    temp_path = path + ".tmp"
+    payload = {"schema_version": TRANSLATION_SPEC_VERSION, **settings}
+    with open(temp_path, "w", encoding="utf-8", newline="\n") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.replace(temp_path, path)
+    return path
+
+
+def _write_academic_ingestion(temp_dir, input_file, input_md, fingerprint, settings, details):
+    unresolved = [
+        item for item in details.get("resource_rewrites", [])
+        if item.get("status") == "unresolved"
+    ]
+    report = {
+        "schema_version": 1,
+        "profile": "academic",
+        "original_path": os.path.realpath(input_file),
+        "source": fingerprint,
+        "normalized_input": {
+            "path": os.path.basename(input_md),
+            "sha256": file_hash(input_md),
+            "char_count": len(Path(input_md).read_text(encoding="utf-8")),
+        },
+        "parser": {
+            "name": "pre-extracted-markdown",
+            "version": "translate-cs-bounded-markdown-v1",
+            "document_kind": settings["document_kind"],
+            "subjects": settings["subjects"],
+            "limitations": [
+                "This scanner recognizes a bounded Markdown subset; it is not a full CommonMark or Pandoc AST parser.",
+                "Reading order, parser omissions, table correctness, and equation completeness require human/model inspection.",
+            ],
+        },
+        "normalizations": details.get("transformations", []),
+        "preserved_nbsp_count": details.get("preserved_nbsp_count", 0),
+        "resource_rewrites": details.get("resource_rewrites", []),
+        "unresolved_resource_count": len(unresolved),
+        "manual_checks_required": [
+            "reading_order_and_scope",
+            "equation_completeness_and_delimiters",
+            "table_rows_columns_and_headers",
+            "image_targets_and_missing_assets",
+        ],
+    }
+    path = os.path.join(temp_dir, "ingestion.json")
+    temp_path = path + ".tmp"
+    with open(temp_path, "w", encoding="utf-8", newline="\n") as handle:
+        json.dump(report, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.replace(temp_path, path)
+    return report
+
+
+def _changed_academic_source_resources(ingestion):
+    """Find linked local assets whose source bytes changed since import."""
+    changed = []
+    for resource in ingestion.get("resource_rewrites", []) if isinstance(ingestion, dict) else []:
+        if not isinstance(resource, dict) or resource.get("kind") != "local_image":
+            continue
+        source_path = resource.get("source_path")
+        expected_hash = resource.get("sha256")
+        if not isinstance(source_path, str) or not expected_hash or not os.path.isfile(source_path):
+            continue
+        try:
+            if file_hash(source_path) != expected_hash:
+                changed.append(source_path)
+        except OSError:
+            changed.append(source_path)
+    return changed
+
+
+def _do_split_and_manifest(temp_dir, input_md, chunk_size, academic=False):
     """Split markdown and create manifest. Returns chunk count or 0 on failure."""
     existing = _find_existing_chunk_files(temp_dir)
     if existing:
         print(f"Skipping markdown splitting - found {len(existing)} existing chunk files")
         # Create/update manifest for existing files
         create_manifest(temp_dir, existing, input_md)
+        if academic:
+            _write_document_map(temp_dir, input_md, existing)
         return len(existing)
 
-    chunk_files = split_markdown_structured(input_md, temp_dir, chunk_size)
+    chunk_files = split_markdown_structured(input_md, temp_dir, chunk_size, academic=academic)
     if not chunk_files:
         return 0
     create_manifest(temp_dir, chunk_files, input_md)
@@ -1041,9 +1513,27 @@ def main():
         help="Input file: PDF, DOCX, or EPUB (converted by Calibre), or Markdown (.md/.markdown), "
              "e.g. the output of a layout-aware PDF parser such as MinerU or Marker",
     )
-    parser.add_argument("-l", "--ilang", default="auto", help="Input language (default: auto)")
-    parser.add_argument("--olang", default="zh", help="Output language (default: zh)")
-    parser.add_argument("--chunk-size", type=int, default=6000, help="Target chunk size in characters (default: 6000)")
+    parser.add_argument("-l", "--ilang", default=None, help="Input language (default: auto)")
+    parser.add_argument("--olang", default=None, help="Output language (default: zh)")
+    parser.add_argument("--chunk-size", type=int, default=None, help="Target chunk size in characters (default: 6000)")
+    parser.add_argument("--profile", choices=("generic", "academic"), default=None,
+                         help="Translation profile (default: generic; academic preserves technical structure)")
+    parser.add_argument("--document-kind", choices=("auto", "paper", "book"), default=None,
+                         help="Academic document type")
+    parser.add_argument("--subject", dest="subjects", action="append", default=None,
+                         help="Academic subject; repeat for multiple values (cs, ai, llm, agent, math)")
+    parser.add_argument("--review-mode", choices=("risk_based", "full", "structural_only"), default=None,
+                         help="Requested academic review coverage")
+    parser.add_argument("--review-sample-rate", type=float, default=None,
+                         help="Risk-based sample rate for non-critical chunks (default: 0.1; at least one chunk)")
+    parser.add_argument('--independent-review', action='store_true', help='Require a separate reviewer/context for semantic review')
+    parser.add_argument('--pdf-parser', choices=['marker', 'mineru', 'poppler'])
+    parser.add_argument('--simple-pdf', action='store_true')
+    parser.add_argument('--latex-main', help='Main TeX file relative to a project directory')
+    parser.add_argument("--format", dest="requested_formats", choices=("md", "html", "docx", "epub", "pdf"),
+                         action="append", default=None, help="Requested output format; repeat as needed")
+    parser.add_argument("--custom-instructions", default=None,
+                         help="Additional translation instructions included in the run identity")
     parser.add_argument(
         "--temp-root",
         default=None,
@@ -1058,6 +1548,42 @@ def main():
 
     args = parser.parse_args()
     input_file = args.input_file
+
+    if (Path(input_file).suffix.lower() == '.tex' or Path(input_file).is_dir()
+            or (Path(input_file).suffix.lower() == '.pdf' and args.pdf_parser)):
+        # Keep extraction isolated. The recursively invoked Markdown path keeps
+        # its established identity; original project/PDF identity remains in the
+        # parser report and ingestion attachment, never masquerading as MD bytes.
+        import tempfile
+        parent = Path(args.temp_root or Path.cwd()).resolve()
+        parent.mkdir(parents=True, exist_ok=True)
+        extraction = Path(tempfile.mkdtemp(prefix=Path(input_file).stem + '-parsed-', dir=parent))
+        if Path(input_file).suffix.lower() == '.pdf':
+            import pdf_ingest
+            markdown, origin = pdf_ingest.parse_pdf(input_file, extraction, args.pdf_parser, simple_pdf=args.simple_pdf)
+        else:
+            import latex_ingest
+            markdown, origin = latex_ingest.parse_project(input_file, extraction, args.latex_main)
+        forwarded = sys.argv[1:]
+        forwarded[0] = str(markdown)
+        # Remove input-adapter-only options from the normalized Markdown call.
+        for flag in ('--pdf-parser', '--latex-main'):
+            if flag in forwarded:
+                i = forwarded.index(flag)
+                del forwarded[i:i + 2]
+        if '--simple-pdf' in forwarded:
+            forwarded.remove('--simple-pdf')
+        result = subprocess.run([sys.executable, str(Path(__file__).resolve()), *forwarded], check=False)
+        if result.returncode:
+            sys.exit(result.returncode)
+        imported = Path(build_temp_dir(str(markdown), args.temp_root))
+        record = imported / 'ingestion.json'
+        if record.is_file():
+            payload = json.loads(record.read_text(encoding='utf-8'))
+            payload['original_input'] = origin
+            from content_guard import _atomic_write
+            _atomic_write(record, json.dumps(payload, ensure_ascii=False, indent=2))
+        return
 
     if not os.path.exists(input_file):
         print(f"Error: Input file not found: {input_file}")
@@ -1077,7 +1603,6 @@ def main():
     else:
         print("=== File Conversion via Calibre HTMLZ ===")
     print(f"Input file: {input_file}")
-    print(f"Target chunk size: {args.chunk_size} characters")
     if args.temp_root:
         print(f"Temp root: {args.temp_root}")
 
@@ -1085,6 +1610,17 @@ def main():
 
     try:
         temp_dir = build_temp_dir(input_file, args.temp_root)
+        settings = _resolve_translation_settings(args, temp_dir)
+        if args.independent_review:
+            settings['require_independent_review'] = True
+            settings['review_policy_version'] = 'academic-review-v2'
+        print(f"Target chunk size: {settings['chunk_size']} characters")
+        if settings["profile"] == "academic" and not is_markdown:
+            raise ValueError(
+                "The academic profile currently requires layout-aware Markdown input. "
+                "Parse the PDF/DOCX/EPUB first, then pass the resulting .md file."
+            )
+        _check_chunking_cache(temp_dir, settings)
         current_fingerprint = source_fingerprint(input_file)
         _abort_on_source_cache_mismatch(
             *check_source_cache(temp_dir, current_fingerprint), temp_dir=temp_dir
@@ -1092,19 +1628,53 @@ def main():
 
         if is_markdown:
             input_md = os.path.join(temp_dir, "input.md")
+            ingestion_details = {"transformations": [], "resource_rewrites": []}
             with open(input_file, 'r', encoding='utf-8') as f:
                 metadata = markdown_metadata(f.read())
             if os.path.exists(input_md):
                 print("Skipping Markdown import - input.md already exists")
-            elif not import_markdown_input(input_file, input_md, temp_dir):
+                if settings["profile"] == "academic":
+                    ingestion_path = os.path.join(temp_dir, "ingestion.json")
+                    if not os.path.isfile(ingestion_path):
+                        raise ValueError(
+                            "Academic cache has no ingestion.json provenance record. "
+                            "Use a fresh --temp-root so source normalization can be audited."
+                        )
+                    with open(ingestion_path, "r", encoding="utf-8") as handle:
+                        previous_ingestion = json.load(handle)
+                    if previous_ingestion.get("normalized_input", {}).get("sha256") != file_hash(input_md):
+                        raise ValueError("Academic ingestion record does not match input.md; use a fresh --temp-root.")
+                    changed_resources = _changed_academic_source_resources(previous_ingestion)
+                    if changed_resources:
+                        raise ValueError(
+                            "Academic source image bytes changed since import: " + ", ".join(changed_resources) +
+                            ". Use a fresh --temp-root so existing translations remain recoverable."
+                        )
+                    ingestion_details = {
+                        "transformations": previous_ingestion.get("normalizations", []),
+                        "resource_rewrites": previous_ingestion.get("resource_rewrites", []),
+                        "preserved_nbsp_count": previous_ingestion.get("preserved_nbsp_count", 0),
+                    }
+            elif not import_markdown_input(
+                input_file, input_md, temp_dir, academic=settings["profile"] == "academic",
+                ingestion_details=ingestion_details,
+            ):
                 sys.exit(1)
 
-            chunk_count = _do_split_and_manifest(temp_dir, input_md, args.chunk_size)
+            chunk_count = _do_split_and_manifest(
+                temp_dir, input_md, settings["chunk_size"], academic=settings["profile"] == "academic"
+            )
             if chunk_count == 0:
                 sys.exit(1)
 
-            create_config_file(temp_dir, input_file, args.ilang, args.olang, metadata,
+            if settings["profile"] == "academic":
+                _write_academic_ingestion(
+                    temp_dir, input_file, input_md, current_fingerprint, settings, ingestion_details
+                )
+            create_config_file(temp_dir, input_file, settings["source_lang"], settings["target_lang"], metadata,
                                conversion_method=MARKDOWN_CONVERSION_METHOD)
+            if settings["profile"] == "academic" or _load_translation_spec(temp_dir) is not None:
+                _write_translation_spec(temp_dir, settings)
             _write_source_fingerprint(temp_dir, current_fingerprint)
             print("Conversion completed successfully!")
             print(f"Temp directory: {temp_dir}")
@@ -1152,11 +1722,15 @@ def main():
                 if not convert_html_to_markdown(input_html_path, input_md, strip_page_numbers=args.strip_page_numbers):
                     sys.exit(1)
 
-            chunk_count = _do_split_and_manifest(temp_dir, input_md, args.chunk_size)
+            chunk_count = _do_split_and_manifest(
+                temp_dir, input_md, settings["chunk_size"], academic=settings["profile"] == "academic"
+            )
             if chunk_count == 0:
                 sys.exit(1)
 
-            create_config_file(temp_dir, input_file, args.ilang, args.olang, metadata)
+            create_config_file(temp_dir, input_file, settings["source_lang"], settings["target_lang"], metadata)
+            if settings["profile"] == "academic" or _load_translation_spec(temp_dir) is not None:
+                _write_translation_spec(temp_dir, settings)
             _write_source_fingerprint(temp_dir, current_fingerprint)
             print("Conversion completed successfully!")
             print(f"Temp directory: {temp_dir}")
@@ -1189,11 +1763,15 @@ def main():
                 if not convert_html_to_markdown(input_html, input_md, strip_page_numbers=args.strip_page_numbers):
                     sys.exit(1)
 
-            chunk_count = _do_split_and_manifest(temp_dir, input_md, args.chunk_size)
+            chunk_count = _do_split_and_manifest(
+                temp_dir, input_md, settings["chunk_size"], academic=settings["profile"] == "academic"
+            )
             if chunk_count == 0:
                 sys.exit(1)
 
-            create_config_file(temp_dir, input_file, args.ilang, args.olang, metadata)
+            create_config_file(temp_dir, input_file, settings["source_lang"], settings["target_lang"], metadata)
+            if settings["profile"] == "academic" or _load_translation_spec(temp_dir) is not None:
+                _write_translation_spec(temp_dir, settings)
             _write_source_fingerprint(temp_dir, current_fingerprint)
 
             print("Conversion completed successfully!")

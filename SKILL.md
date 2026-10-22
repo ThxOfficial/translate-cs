@@ -1,26 +1,35 @@
 ---
-name: translate-book
-description: Translate books (PDF/DOCX/EPUB) into any language using parallel sub-agents. Converts input -> Markdown chunks -> translated chunks -> HTML/DOCX/EPUB/PDF.
+name: translate-cs
+description: Translate CS, AI, LLM, agent, and mathematical papers or technical books with structure preservation, terminology control, and semantic review; also supports general books through the compatible generic workflow.
 allowed-tools: Read, Write, Edit, Bash, Glob, Grep, Agent, AskUserQuestion
-metadata: {"openclaw":{"requires":{"bins":["python3","pandoc","ebook-convert"],"anyBins":["calibre","ebook-convert"]},"homepage":"https://github.com/deusyu/translate-book"}}
+metadata: {"openclaw":{"requires":{"bins":["python3","pandoc","ebook-convert"],"anyBins":["calibre","ebook-convert"]},"homepage":"https://github.com/ThxOfficial/translate-cs"}}
 ---
 
 # Book Translation Skill
 
-You are a book translation assistant. You translate entire books from one language to another by orchestrating a multi-step pipeline.
+You translate books and papers from one language to another by orchestrating a multi-step pipeline.
+
+For computer science, AI, LLM, agent, or mathematics papers and technical books, select the `academic` profile and read [references/academic-translation.md](references/academic-translation.md). That reference overrides the generic steps below where they conflict. Keep the default `generic` profile for other books and documents so existing behavior remains unchanged.
+
+For academic B/C workflows, follow [references/advanced-academic.md](references/advanced-academic.md): migrate glossary v3 explicitly, resolve occurrence senses, record actual translator identities and use a separate context for required independent review. Use installed local PDF/LaTeX adapters and requested native formats; optional bilingual views, notes and table row groups obey the same quality gate. For math subfields, read [references/math-domains.md](references/math-domains.md). Do not install parser models or upload sources implicitly.
 
 ## Workflow
 
 ### 1. Collect Parameters
 
 Determine the following from the user's message:
-- **file_path**: Path to the input file (PDF, DOCX, EPUB, or Markdown) — REQUIRED
+- **file_path**: Path to the input file (PDF, DOCX, EPUB, Markdown, or an academic LaTeX main/project) — REQUIRED
 - **target_lang**: Target language code (default: `zh`) — e.g. zh, en, ja, ko, fr, de, es
 - **concurrency**: Number of parallel sub-agents per batch (default: `8`)
 - **temp_root**: Optional directory under which `{filename}_temp/` should be created
 - **epub_cover**: Optional explicit cover image path for EPUB output
 - **export_name**: Optional filename stem for user-facing output aliases
 - **custom_instructions**: Any additional translation instructions from the user (optional)
+- **profile**: `academic` for CS/AI/LLM/agent/math papers or technical books; otherwise `generic`
+- **document_kind**: `paper`, `book`, or `auto` for the academic profile
+- **subjects**: Any relevant combination of `cs`, `ai`, `llm`, `agent`, and `math`
+- **review_mode**: `risk_based` (default), `full`, or `structural_only` for academic work
+- **requested_formats**: Requested output formats; academic default is Markdown and HTML, generic default stays unchanged
 
 If the file path is not provided, ask the user.
 
@@ -31,6 +40,8 @@ Run the conversion script to produce chunks:
 ```bash
 python3 {baseDir}/scripts/convert.py "<file_path>" --olang "<target_lang>"
 ```
+
+For the academic profile, use `--profile academic` and the options in the academic references. Supply inspected layout-aware Markdown, an explicitly selected installed local PDF parser, or a supported LaTeX main/project. Academic DOCX/EPUB input requires pre-extracted Markdown. Do not route an academic source through Calibre's generic conversion path.
 
 If the user provided `temp_root`, add `--temp-root "<temp_root>"`. The temp
 directory leaf name remains `{filename}_temp/`; only the parent directory
@@ -82,6 +93,12 @@ A separate sub-agent translates each chunk with a fresh context. Without shared 
 
 If `<temp_dir>/glossary.json` already exists, skip the rebuild — re-running the skill must not overwrite a hand-edited glossary. To force a rebuild, delete the file.
 
+For academic Chinese translation, first run `glossary.py seed-academic` with the selected subjects. This only adds missing, non-colliding seed entries and never overwrites hand-edited terms. Then extract document-specific terminology and inject both translations and semantic `notes` into each task. Do not use Chinese seed targets for another output language.
+
+Before translating academic input, inspect `input.md`, `ingestion.json`, and `document_map.json` for reading order, omissions, equations, tables, and image targets. Record all required checks and source-evidenced findings with `quality.py --record-input-review`; the final quality gate rejects a missing or stale inspection.
+
+For academic runs, also build and confirm source-grounded whole-document context as described in [references/document-context.md](references/document-context.md). Task snapshots select relevant parent definitions and section-local symbols; candidates remain unconfirmed until the coordinator reads their evidence. Refresh snapshots and plan again after context corrections, including the final batch.
+
 Otherwise:
 
 1. **Sample chunks**: read `chunk0001.md`, the last chunk, and 3 evenly-spaced middle chunks. If `chunk_count < 5`, sample all of them.
@@ -119,6 +136,8 @@ affected.
 
 ### 3.7. Plan Selective Re-translation
 
+Before planning an academic run, prepare every chunk with `content_guard.py prepare`, refresh the document first-occurrence plan with `task_context.py <temp_dir> --prepare-first-occurrences`, and write a current context snapshot for every chunk with `task_context.py <temp_dir> <chunk_id> --write`. The academic reference gives the exact order and review workflow.
+
 Run:
 
 ```bash
@@ -150,13 +169,15 @@ to Step 5.
 
 **Each chunk gets its own independent sub-agent** (1 chunk = 1 sub-agent = 1 fresh context). This prevents context accumulation and output truncation.
 
+For academic work, follow the task contract and translation rules in [references/academic-translation.md](references/academic-translation.md): write a masked draft, restore it through `content_guard.py`, and never write directly to the canonical output before validation. Do not use the generic translation prompt below for academic chunks.
+
 Launch chunks in batches to respect API rate limits:
 - Each batch: up to `concurrency` sub-agents in parallel (default: 8)
 - Wait for the current batch to complete before launching the next
 
 **Spawn each sub-agent with the following task.** Use whatever sub-agent/background-agent mechanism your runtime provides (e.g. the Agent tool, sessions_spawn, or equivalent).
 
-The output file is `output_` prefixed to the source filename: `chunk0001.md` → `output_chunk0001.md`.
+For the generic profile, the output file is `output_` prefixed to the source filename: `chunk0001.md` → `output_chunk0001.md`. Academic chunks follow the masked-draft and restore contract in the linked reference.
 
 > Translate the file `<temp_dir>/chunk<NNNN>.md` to {TARGET_LANGUAGE} and write the result to `<temp_dir>/output_chunk<NNNN>.md`. Follow the translation rules below. Output only the translated content — no commentary.
 
@@ -239,7 +260,7 @@ IMPORTANT REQUIREMENTS:
 2. 仅翻译文字内容，保留所有 Markdown 语法和文件名
    - 数学公式（行内 `$...$`、公式块 `$$...$$`）内的 LaTeX 原样保留，不要翻译、改写或删除其中任何字符
    - 表格（Markdown `| ... |` 表格或 HTML `<table>`）保持行列结构不变，只翻译单元格中的文字
-3. 删除空链接、不必要的字符和如: 行末的'\\'。页码已由 convert.py 上游处理，不要再删除独立的数字行（可能是年份 1984、章节编号、引用编号等正文内容）。
+3. 删除空链接、不必要的字符和如: 行末的'\\'。页码已由 convert.py 处理，不要再删除独立的数字行（可能是年份 1984、章节编号、引用编号等正文内容）。
 4. 保证格式和语义准确翻译内容自然流畅
 5. 只输出翻译后的正文内容，不要有任何说明、提示、注释或对话内容。
 6. 表达清晰简洁，不要使用复杂的句式。请严格按顺序翻译，不要跳过任何内容。
@@ -355,9 +376,13 @@ Each sub-agent emitted an `output_chunk<NNNN>.meta.json` alongside its translate
 
 On a fresh run after a previous interrupted batch, `prepare-merge` will pick up any meta files left behind. Don't manually delete them.
 
+For academic work, after all batch merges refresh protected manifests, the first-occurrence plan, and task snapshots; rerun the selective planner and translate affected chunks before semantic review. Limit this reconciliation to two rounds. Then apply the required per-chunk self-checks and configured coordinator-review coverage in the academic reference.
+
 ### 5. Verify Completeness and Retry
 
 After all batches complete, use Glob to check that every source chunk has a corresponding output file.
+
+For academic work, run `quality.py --review-plan <temp_dir>` and record the exact required checks with `quality.py --record-review`. Run the final quality report before building. Only `validated` is eligible for the default final build; use `--allow-draft` only when the user explicitly requests an intermediate draft, and never use it to bypass a `blocked` result.
 
 If any are missing, retry them — each missing chunk as its own sub-agent. Maximum 2 attempts per chunk (initial + 1 retry).
 
@@ -407,6 +432,9 @@ python3 {baseDir}/scripts/merge_and_build.py --temp-dir "<temp_dir>" --title "<t
 
 If the user provided `epub_cover`, add `--cover "<epub_cover>"`. If the user
 provided `export_name`, add `--export-name "<export_name>"`.
+
+For academic work, build only the requested formats after quality validation. Keep intermediates and both reports; omit `--cleanup`. If the user explicitly requested a draft with incomplete semantic review, add `--allow-draft` and report its draft status.
+Use `--rebuild` after template or renderer changes to regenerate derived outputs while retaining translations, glossary entries, and review evidence.
 
 The `--cleanup` flag removes intermediate files (chunks, input.html, etc.) after a fully successful build. If the user asked to keep intermediates, omit `--cleanup`.
 

@@ -561,6 +561,13 @@ class SelectTermsForChunkTests(unittest.TestCase):
         self.assertEqual(local_in_selected, 20)
         self.assertEqual(len(selected), 50)
 
+    def test_strict_mode_fails_instead_of_truncating_required_local_terms(self):
+        g = make_glossary(('attention', '注意力'), ('gradient', '梯度'), ('inference', '推理'))
+        with self.assertRaisesRegex(ValueError, 'required local terms are never silently dropped'):
+            glossary.select_terms_for_chunk(
+                g, 'attention gradient inference', max_terms=2, fail_on_local_overflow=True
+            )
+
     def test_local_hits_use_boundary_match_for_ascii(self):
         g = make_glossary(('cat', '猫'), ('Manhattan', '曼哈顿'), top_n=0)
         chunk_text = "category and concatenate only — no real cats here"
@@ -642,6 +649,12 @@ class HashTests(unittest.TestCase):
         t2 = {'source': 'Tai', 'target': '太一', 'category': 'person', 'aliases': ['B', 'A']}
         self.assertEqual(glossary.term_hash(t1), glossary.term_hash(t2))
 
+    def test_term_hash_changes_when_semantic_notes_change(self):
+        t1 = {'source': 'agent', 'target': '智能体', 'category': 'agent', 'notes': 'AI system'}
+        t2 = {'source': 'agent', 'target': '智能体', 'category': 'agent', 'notes': 'network proxy'}
+        self.assertEqual(glossary.term_hash(t1), glossary.term_hash(t2))
+        self.assertNotEqual(glossary.term_hash(t1, include_notes=True), glossary.term_hash(t2, include_notes=True))
+
     def test_term_hash_without_aliases_keeps_historical_value(self):
         # Backwards compatibility: alias-less terms must hash exactly as the
         # pre-alias format did, so old run_state.json records stay valid and
@@ -684,6 +697,43 @@ class FormatTermsForPromptTests(unittest.TestCase):
         terms = [{'source': 'Tai', 'target': '太一', 'aliases': ['T|ai']}]
         out = glossary.format_terms_for_prompt(terms)
         self.assertIn(r'T\|ai', out)
+
+    def test_formats_semantic_notes_separately_from_legacy_table(self):
+        terms = [{'source': 'agent', 'target': '智能体', 'notes': 'Only in AI-system contexts.'}]
+        self.assertEqual(
+            glossary.format_terms_for_prompt(terms),
+            '| 原文 | 别名 | 译文 |\n|------|------|------|\n| agent |  | 智能体 |',
+        )
+        self.assertIn('AI-system contexts', glossary.format_semantic_notes_for_prompt(terms))
+
+
+class AcademicSeedTests(unittest.TestCase):
+    def test_seed_adds_missing_terms_without_overwriting_hand_edits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'glossary.json')
+            glossary.save_glossary(path, {
+                'version': 2,
+                'terms': [
+                    {'id': 'agent', 'source': 'agent', 'target': '代理', 'category': 'manual',
+                     'aliases': [], 'gender': 'unknown', 'confidence': 'high', 'frequency': 3,
+                     'evidence_refs': [], 'notes': 'manual choice'},
+                ],
+                'high_frequency_top_n': 20,
+                'applied_meta_hashes': {},
+            })
+            result = glossary.seed_academic_terms(tmp, ['agent'], 'zh')
+            saved = glossary.load_glossary(path)
+            agent = next(term for term in saved['terms'] if term['source'] == 'agent')
+            self.assertEqual(agent['target'], '代理')
+            self.assertEqual(agent['notes'], 'manual choice')
+            self.assertTrue(any(term['source'] == 'tool call' for term in saved['terms']))
+            self.assertTrue(any(item['source'] == 'agent' for item in result['skipped']))
+
+    def test_seed_does_not_apply_chinese_targets_to_other_languages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = glossary.seed_academic_terms(tmp, ['llm'], 'en')
+            self.assertEqual(result['added'], [])
+            self.assertFalse(os.path.exists(os.path.join(tmp, 'glossary.json')))
 
 
 class SaveGlossaryAtomicTests(unittest.TestCase):

@@ -116,6 +116,25 @@ def validate_meta(data, path='<meta>'):
         )
 
     schema_version = data.get('schema_version')
+    if schema_version == 2:
+        if set(data) != {'schema_version', 'term_proposals', 'used_term_ids'}:
+            raise ValueError('v2 meta requires exactly term_proposals and used_term_ids; identity comes from filename')
+        if not isinstance(data['used_term_ids'], list) or any(not isinstance(t, str) or not t for t in data['used_term_ids']):
+            raise ValueError('v2 used_term_ids must be nonempty strings')
+        if not isinstance(data['term_proposals'], list):
+            raise ValueError('v2 term_proposals must be a list')
+        allowed = {'term_id', 'source', 'target', 'sense', 'scope', 'alias', 'evidence', 'action'}
+        for item in data['term_proposals']:
+            if not isinstance(item, dict) or set(item) - allowed or not (item.get('term_id') or item.get('source')):
+                raise ValueError('v2 proposal needs a term_id or source and only declared fields')
+            if not isinstance(item.get('evidence'), str) or not item['evidence'] or len(item['evidence']) > EVIDENCE_MAX_LEN:
+                raise ValueError('v2 proposal requires bounded source evidence')
+            for key in ('term_id', 'source', 'target', 'sense', 'alias', 'action'):
+                if key in item and not isinstance(item[key], str):
+                    raise ValueError('v2 textual fields must be strings')
+            if 'scope' in item and not isinstance(item['scope'], dict):
+                raise ValueError('v2 scope must be an object')
+        return
     if schema_version != META_SCHEMA_VERSION:
         raise ValueError(
             f"Meta at {path}: schema_version mismatch — expected "

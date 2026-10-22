@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-run_state.py - Selective re-translation state for translate-book.
+run_state.py - Selective re-translation state for translate-cs.
 
 The state file records what glossary and source/output hashes were used for
 each translated chunk. Future runs can then decide which chunks need actual
@@ -9,6 +9,7 @@ only need their state recorded.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -17,11 +18,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import glossary as glossary_mod
+import task_context as task_context_mod
 from manifest import file_hash, load_manifest, read_output_text
 
 
 RUN_STATE_VERSION = 1
 RUN_STATE_FILE = "run_state.json"
+
+TRANSLATION_SPEC_FIELDS = (
+    "profile", "document_kind", "subjects", "source_lang", "target_lang",
+    "style", "term_display", "code_policy", "prompt_example_policy",
+    "bibliography_policy", "translator_notes", "custom_instructions",
+    "translation_prompt_version", "translation_prompt_sha256", "protection_version",
+)
 
 
 def _run_state_path(temp_dir):
@@ -108,21 +117,60 @@ def _load_glossary(temp_dir):
     return glossary, glossary_hash, terms, term_by_id
 
 
+def _translation_spec_hash(temp_dir):
+    path = os.path.join(temp_dir, "translation_spec.json")
+    if not os.path.exists(path):
+        return ""
+    with open(path, "r", encoding="utf-8") as handle:
+        spec = json.load(handle)
+    if not isinstance(spec, dict) or spec.get("schema_version") != 1:
+        raise ValueError(f"Unsupported translation spec: {path}")
+    relevant = {key: spec.get(key) for key in TRANSLATION_SPEC_FIELDS}
+    canonical = json.dumps(relevant, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _task_context_state(temp_dir, chunk_id):
+    """Return (current expected hash, persisted task snapshot hash)."""
+    context_path = Path(temp_dir) / "tasks" / f"{chunk_id}.context.json"
+    spec_path = Path(temp_dir) / "translation_spec.json"
+    if not spec_path.is_file():
+        return "", ""
+    with open(spec_path, "r", encoding="utf-8") as handle:
+        spec = json.load(handle)
+    if spec.get("profile") != "academic" and not context_path.is_file():
+        return "", ""
+    current = task_context_mod.snapshot_hash(task_context_mod.build_context(temp_dir, chunk_id))
+    persisted = task_context_mod.stored_context_hash(temp_dir, chunk_id)
+    return current, persisted
+
+
 def _selected_terms_for_chunk(glossary, source_path):
     if glossary is None or not os.path.exists(source_path):
         return []
     text = Path(source_path).read_text(encoding='utf-8')
+    if glossary.get('version') == 3:
+        import glossary_v3
+        return glossary_v3.resolve_chunk(Path(source_path).parent, Path(source_path).stem, glossary)['terms']
     return glossary_mod.select_terms_for_chunk(glossary, text)
 
 
-def _term_ids_and_hashes(terms):
+def _term_ids_and_hashes(terms, include_notes=False):
     ids = []
     hashes = {}
     for term in terms:
         term_id = term.get('id', term.get('source'))
         ids.append(term_id)
-        hashes[term_id] = glossary_mod.term_hash(term)
+        hashes[term_id] = glossary_mod.term_hash(term, include_notes=include_notes)
     return ids, hashes
+
+
+def _academic_profile(temp_dir):
+    path = os.path.join(temp_dir, "translation_spec.json")
+    if not os.path.isfile(path):
+        return False
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle).get("profile") == "academic"
 
 
 def _now_utc():
@@ -151,7 +199,10 @@ def build_chunk_record(temp_dir, chunk_id):
 
     glossary, glossary_hash, _, _ = _load_glossary(temp_dir)
     selected_terms = _selected_terms_for_chunk(glossary, source_path)
-    entity_ids, entity_hashes = _term_ids_and_hashes(selected_terms)
+    entity_ids, entity_hashes = _term_ids_and_hashes(selected_terms, include_notes=_academic_profile(temp_dir))
+    translation_spec_hash = _translation_spec_hash(temp_dir)
+    include_notes = _academic_profile(temp_dir)
+    _, task_context_hash = _task_context_state(temp_dir, chunk_id)
 
     return {
         "source_file": entry["source_file"],
@@ -159,17 +210,27 @@ def build_chunk_record(temp_dir, chunk_id):
         "source_hash": file_hash(source_path),
         "output_hash": file_hash(output_path),
         "glossary_version_used": glossary_hash,
+        "translation_spec_hash": translation_spec_hash,
+        "task_context_hash": task_context_hash,
         "entity_ids_used": entity_ids,
         "entity_hashes_used": entity_hashes,
         "updated_at": _now_utc(),
     }
 
 
-def record_chunks(temp_dir, chunk_ids):
+def record_chunks(temp_dir, chunk_ids, translator_id=None, translation_context_id=None):
     state = load_run_state(temp_dir)
     recorded = []
     for chunk_id in chunk_ids:
-        state["chunks"][chunk_id] = build_chunk_record(temp_dir, chunk_id)
+        record = build_chunk_record(temp_dir, chunk_id)
+        previous = state['chunks'].get(chunk_id, {})
+        if translator_id and translation_context_id:
+            record.update(translator_id=translator_id, translation_context_id=translation_context_id)
+        elif previous.get('output_hash') == record['output_hash']:
+            for field in ('translator_id', 'translation_context_id'):
+                if field in previous:
+                    record[field] = previous[field]
+        state["chunks"][chunk_id] = record
         recorded.append(chunk_id)
     save_run_state(temp_dir, state)
     return recorded
@@ -185,10 +246,13 @@ def _reason(item, code, detail=None):
 def plan(temp_dir, retranslate_untracked=False):
     state = load_run_state(temp_dir)
     glossary, glossary_hash, _, _ = _load_glossary(temp_dir)
+    translation_spec_hash = _translation_spec_hash(temp_dir)
+    include_notes = _academic_profile(temp_dir)
 
     result = {
         "temp_dir": temp_dir,
         "glossary_hash": glossary_hash,
+        "translation_spec_hash": translation_spec_hash,
         "translation_chunk_ids": [],
         "record_only_chunk_ids": [],
         "unchanged_chunk_ids": [],
@@ -200,6 +264,8 @@ def plan(temp_dir, retranslate_untracked=False):
             "untracked_existing_output",
             "source_hash_changed_since_record",
             "glossary_term_selection_or_term_hash_changed",
+            "translation_spec_changed",
+            "task_context_changed",
         ],
         "record_update_rules": [
             "output_hash_changed_since_record",
@@ -258,8 +324,25 @@ def plan(temp_dir, retranslate_untracked=False):
                 _reason(item, "source_hash_changed_since_record")
 
         if item["action"] == "unchanged" and record is not None:
+            if record.get("translation_spec_hash", "") != translation_spec_hash:
+                item["action"] = "translate"
+                _reason(item, "translation_spec_changed")
+
+        if item["action"] == "unchanged" and record is not None:
+            current_context_hash, persisted_context_hash = _task_context_state(temp_dir, chunk_id)
+            if not persisted_context_hash and current_context_hash:
+                item["action"] = "translate"
+                _reason(item, "task_context_snapshot_missing")
+            elif persisted_context_hash and current_context_hash != persisted_context_hash:
+                item["action"] = "translate"
+                _reason(item, "task_context_material_changed")
+            elif record.get("task_context_hash", "") != persisted_context_hash:
+                item["action"] = "translate"
+                _reason(item, "task_context_changed")
+
+        if item["action"] == "unchanged" and record is not None:
             selected_terms = _selected_terms_for_chunk(glossary, source_path)
-            current_entity_ids, current_entity_hashes = _term_ids_and_hashes(selected_terms)
+            current_entity_ids, current_entity_hashes = _term_ids_and_hashes(selected_terms, include_notes=include_notes)
             recorded_entity_ids = record.get("entity_ids_used", [])
             recorded_entity_hashes = record.get("entity_hashes_used", {})
 
@@ -325,6 +408,8 @@ def main():
     p_record = sub.add_parser('record', help="Record one or more completed output chunks")
     p_record.add_argument('temp_dir')
     p_record.add_argument('chunk_ids', nargs='+')
+    p_record.add_argument('--translator-id')
+    p_record.add_argument('--translation-context-id')
 
     p_record_all = sub.add_parser('record-all', help="Record every complete output chunk")
     p_record_all.add_argument('temp_dir')
@@ -338,7 +423,10 @@ def main():
         if args.cmd == 'plan':
             _print_json(plan(args.temp_dir, retranslate_untracked=args.retranslate_untracked))
         elif args.cmd == 'record':
-            _print_json({"recorded_chunk_ids": record_chunks(args.temp_dir, args.chunk_ids)})
+            if bool(args.translator_id) != bool(args.translation_context_id):
+                raise ValueError('Record translator and translation-context identities together')
+            _print_json({"recorded_chunk_ids": record_chunks(args.temp_dir, args.chunk_ids,
+                         args.translator_id, args.translation_context_id)})
         elif args.cmd == 'record-all':
             plan_data = plan(args.temp_dir)
             eligible = [

@@ -1,0 +1,16 @@
+/* Academic format additions; source prose and mathematical content are unchanged. */
+body { font-family: "Noto Serif CJK SC", "Microsoft YaHei", "SimSun", serif; line-height: 1.65; }
+math[display="block"], .math.display { display: block; max-width: 100%; overflow-x: auto; padding: .3em 0; }
+table { max-width: 100%; border-collapse: collapse; }
+th, td { padding: .35em .65em; vertical-align: top; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+img { max-width: 100%; height: auto; }
+.footnotes { font-size: .9em; }
+@media print {
+  @page { size: A4; margin: 18mm; }
+  body { font-size: 10.5pt; }
+  h1,h2,h3,h4 { break-after: avoid; }
+  tr, math, figure { break-inside: avoid; }
+  table { width: 100%; font-size: .9em; }
+  thead { display: table-header-group; }
+}

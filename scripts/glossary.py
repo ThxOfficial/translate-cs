@@ -73,7 +73,7 @@ def glossary_hash(glossary):
     return hashlib.sha256(_canonical_json(glossary).encode('utf-8')).hexdigest()
 
 
-def term_hash(term):
+def term_hash(term, include_notes=False):
     """SHA-256 of a single term's prompt-affecting fields.
 
     Aliases participate because they are injected into the per-chunk term
@@ -83,10 +83,16 @@ def term_hash(term):
     appended only when aliases exist, so alias-less terms keep their
     historical hash and existing run_state.json records stay valid.
     """
+    if 'translation_policy' in term:
+        import glossary_v3
+        return glossary_v3.term_hash(term)
     payload = f"{term.get('source', '')}→{term.get('target', '')}|{term.get('category', '')}"
     aliases = sorted(term.get('aliases', []) or [])
     if aliases:
         payload += '|aliases=' + json.dumps(aliases, ensure_ascii=False)
+    notes = term.get('notes', '')
+    if include_notes and notes:
+        payload += '|notes=' + notes
     return hashlib.sha256(payload.encode('utf-8')).hexdigest()
 
 
@@ -315,6 +321,9 @@ def load_glossary(path):
         raise ValueError(f"Glossary at {path} must be a JSON object, got {type(data).__name__}")
 
     version = data.get('version')
+    if version == 3:
+        import glossary_v3
+        return glossary_v3.validate(data)
     if version not in (1, 2):
         raise ValueError(
             f"Glossary schema version mismatch in {path}: "
@@ -371,6 +380,12 @@ def load_glossary(path):
 def save_glossary(path, glossary):
     """Atomically write the glossary as v2. Re-asserts the v2 invariants
     (per-term shape, surface-form uniqueness, etc.) before writing."""
+    if glossary.get('version') == 3:
+        import glossary_v3
+        glossary_v3.validate(glossary)
+        from content_guard import _atomic_write
+        _atomic_write(path, json.dumps(glossary, ensure_ascii=False, indent=2, sort_keys=True) + '\n')
+        return
     glossary['version'] = GLOSSARY_SCHEMA_VERSION
     glossary.setdefault('applied_meta_hashes', {})
     for term in glossary.get('terms', []):
@@ -474,7 +489,7 @@ def count_frequencies(glossary_path, chunks_dir):
     save_glossary(glossary_path, glossary)
 
 
-def select_terms_for_chunk(glossary, chunk_text, top_n=None, max_terms=DEFAULT_MAX_TERMS):
+def select_terms_for_chunk(glossary, chunk_text, top_n=None, max_terms=DEFAULT_MAX_TERMS, fail_on_local_overflow=False):
     """Return terms relevant to a single chunk: union of (terms whose source
     or any alias appears in chunk_text) and (top-N most-frequent terms across
     the whole book).
@@ -482,6 +497,8 @@ def select_terms_for_chunk(glossary, chunk_text, top_n=None, max_terms=DEFAULT_M
     Local hits are protected — if the union exceeds max_terms, local hits keep
     their slots and global top-N is what gets truncated.
     """
+    if glossary.get('version') == 3:
+        raise ValueError('v3 selection requires chunk structure; use task_context.py or glossary_v3.resolve_chunk')
     if top_n is None:
         top_n = glossary.get('high_frequency_top_n', DEFAULT_TOP_N)
 
@@ -493,6 +510,12 @@ def select_terms_for_chunk(glossary, chunk_text, top_n=None, max_terms=DEFAULT_M
 
     local_terms = [t for t in terms if t.get('source') and _term_appears_in_text(t, chunk_text)]
     local_terms.sort(key=sort_key)
+
+    if fail_on_local_overflow and len(local_terms) > max_terms:
+        raise ValueError(
+            f"Chunk contains {len(local_terms)} local glossary terms, exceeding the {max_terms}-term prompt limit. "
+            "Split the translation task or curate the glossary; required local terms are never silently dropped."
+        )
 
     local_ids = {t.get('id', t.get('source')) for t in local_terms}
     top_pool = sorted(
@@ -528,8 +551,95 @@ def format_terms_for_prompt(terms):
     return '\n'.join(rows)
 
 
+def format_semantic_notes_for_prompt(terms):
+    """Render only explicit sense/use guidance, without changing the legacy table."""
+    rows = []
+    for term in terms or []:
+        notes = (term.get('notes') or '').strip()
+        if notes:
+            source = term.get('source', '').replace('|', '\\|')
+            rows.append(f"- `{source}`：{notes}")
+    if not rows:
+        return ''
+    return '术语语义说明（按当前文献语境使用；若原文含义冲突，记录歧义并保留原文）：\n' + '\n'.join(rows)
+
+
+def _empty_glossary():
+    return {
+        'version': GLOSSARY_SCHEMA_VERSION,
+        'terms': [],
+        'high_frequency_top_n': DEFAULT_TOP_N,
+        'applied_meta_hashes': {},
+    }
+
+
+def seed_academic_terms(temp_dir, subjects=None, target_lang='zh', seed_path=None):
+    """Add missing Chinese CS/AI terms while preserving every existing entry."""
+    if target_lang.lower().replace('_', '-') not in ('zh', 'zh-cn', 'zh-hans'):
+        return {'added': [], 'skipped': [], 'reason': 'seed translations currently target Simplified Chinese'}
+
+    temp_path = Path(temp_dir)
+    temp_path.mkdir(parents=True, exist_ok=True)
+    glossary_path = temp_path / 'glossary.json'
+    glossary = load_glossary(str(glossary_path)) if glossary_path.is_file() else _empty_glossary()
+    seed_path = Path(seed_path) if seed_path else Path(__file__).resolve().parent.parent / 'resources' / 'academic_glossary_seeds.json'
+    seed_data = json.loads(seed_path.read_text(encoding='utf-8'))
+    requested = {value.lower() for value in (subjects or [])}
+    selected = []
+    for term in seed_data.get('terms', []):
+        term_subjects = {value.lower() for value in term.get('subjects', [])}
+        if not requested or not term_subjects or requested.intersection(term_subjects):
+            selected.append(term)
+
+    occupied = {}
+    ids = set()
+    for term in glossary.get('terms', []):
+        ids.add(term.get('id', term.get('source', '')))
+        for surface in [term.get('source', ''), *(term.get('aliases') or [])]:
+            if surface:
+                occupied[surface.casefold()] = term.get('id', term.get('source', ''))
+
+    added, skipped = [], []
+    for seed in selected:
+        source = seed['source']
+        surfaces = [source, *(seed.get('aliases') or [])]
+        collision = next((occupied[s.casefold()] for s in surfaces if s.casefold() in occupied), None)
+        term_id = seed.get('id', source)
+        if collision is not None:
+            skipped.append({'source': source, 'reason': f'collides with existing term {collision}'})
+            continue
+        if term_id in ids:
+            skipped.append({'source': source, 'reason': f'duplicate term id {term_id}'})
+            continue
+        entry = {
+            'id': term_id,
+            'source': source,
+            'target': seed['target'],
+            'category': seed.get('category', 'technical'),
+            'aliases': list(seed.get('aliases') or []),
+            'gender': 'unknown',
+            'confidence': seed.get('confidence', 'medium'),
+            'frequency': 0,
+            'evidence_refs': [],
+            'notes': seed.get('notes', ''),
+        }
+        if glossary.get('version') == 3:
+            import glossary_v3
+            glossary_v3.defaults(entry)
+            entry['provenance'] = {'kind': 'seed'}
+        glossary['terms'].append(entry)
+        ids.add(term_id)
+        for surface in surfaces:
+            occupied[surface.casefold()] = term_id
+        added.append(source)
+
+    if added or not glossary_path.is_file():
+        save_glossary(str(glossary_path), glossary)
+    return {'added': added, 'skipped': skipped}
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Glossary management for translate-book")
+    parser = argparse.ArgumentParser(description="Glossary management for translate-cs")
     sub = parser.add_subparsers(dest='cmd', required=True)
 
     p_count = sub.add_parser('count-frequencies', help="Update frequencies in glossary.json")
@@ -542,26 +652,52 @@ def main():
                          help="Override high_frequency_top_n from glossary.json")
     p_print.add_argument('--max-terms', type=int, default=DEFAULT_MAX_TERMS,
                          help=f"Cap on terms in the table (default: {DEFAULT_MAX_TERMS})")
+    p_print.add_argument('--include-notes', action='store_true',
+                         help="Append semantic notes for selected terms")
+    p_print.add_argument('--strict-local-terms', action='store_true',
+                         help="Fail rather than truncate local terms when they exceed --max-terms")
+
+    p_seed = sub.add_parser('seed-academic', help="Add curated academic terms without replacing existing entries")
+    p_seed.add_argument('temp_dir')
+    p_seed.add_argument('--subject', dest='subjects', action='append', default=None)
+    p_seed.add_argument('--target-lang', default='zh')
 
     p_hash = sub.add_parser('compute-hash', help="Print glossary_hash to stdout")
     p_hash.add_argument('temp_dir')
+    p_migrate = sub.add_parser('migrate-v3', help='Explicitly migrate v1/v2 terms to document-scoped v3')
+    p_migrate.add_argument('temp_dir')
 
     args = parser.parse_args()
     glossary_path = os.path.join(args.temp_dir, 'glossary.json')
 
-    if args.cmd == 'count-frequencies':
+    if args.cmd == 'migrate-v3':
+        import glossary_v3
+        save_glossary(glossary_path, glossary_v3.migrate(load_glossary(glossary_path)))
+    elif args.cmd == 'count-frequencies':
         count_frequencies(glossary_path, args.temp_dir)
     elif args.cmd == 'print-terms-for-chunk':
         glossary = load_glossary(glossary_path)
         chunk_path = os.path.join(args.temp_dir, args.chunk_filename)
         with open(chunk_path, 'r', encoding='utf-8') as f:
             chunk_text = f.read()
+        if glossary.get('version') == 3:
+            import glossary_v3
+            print(json.dumps(glossary_v3.resolve_chunk(args.temp_dir, Path(args.chunk_filename).stem, glossary), ensure_ascii=False, indent=2))
+            return
         terms = select_terms_for_chunk(
-            glossary, chunk_text, top_n=args.top_n, max_terms=args.max_terms
+            glossary, chunk_text, top_n=args.top_n, max_terms=args.max_terms,
+            fail_on_local_overflow=args.strict_local_terms,
         )
         table = format_terms_for_prompt(terms)
         if table:
             print(table)
+            if args.include_notes:
+                notes = format_semantic_notes_for_prompt(terms)
+                if notes:
+                    print('\n' + notes)
+    elif args.cmd == 'seed-academic':
+        result = seed_academic_terms(args.temp_dir, args.subjects, args.target_lang)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
     elif args.cmd == 'compute-hash':
         glossary = load_glossary(glossary_path)
         print(glossary_hash(glossary))

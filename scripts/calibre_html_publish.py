@@ -27,7 +27,9 @@ def find_calibre_convert():
         try:
             result = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=10)
             if result.returncode == 0:
-                print(f"Found Calibre ebook-convert: {path}")
+                version = (result.stdout or result.stderr).strip().splitlines()
+                version_text = version[0] if version else "version unavailable"
+                print(f"Found Calibre ebook-convert: {path} ({version_text})")
                 return path
         except (FileNotFoundError, subprocess.TimeoutExpired):
             continue
@@ -228,7 +230,7 @@ def convert_html_with_calibre(html_file, output_file, format_type, timeout=600, 
         "--title", title,
         "--authors", author,
         "--language", lang,
-        "--book-producer", "translate-book",
+        "--book-producer", "translate-cs",
         "--preserve-cover-aspect-ratio",
         "--smarten-punctuation"
     ]

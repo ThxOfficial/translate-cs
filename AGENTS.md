@@ -2,7 +2,7 @@
 
 ## Project
 
-translate-book is an agent skill for Codex, Claude Code, and OpenClaw that translates books (PDF/DOCX/EPUB) into any language using parallel subagents. Published on ClawHub as `translate-book` and on GitHub as `deusyu/translate-book`.
+translate-cs is a Codex/Claude Code/OpenClaw skill specialized for computer science, AI, LLM, agent, and mathematical literature. GitHub repository: `ThxOfficial/translate-cs`.
 
 ## Structure
 
@@ -51,7 +51,7 @@ Verify: all output_chunk*.md files exist, manifest validation passes, output for
 - Subagent instructions in SKILL.md must be platform-neutral (work on Codex, Claude Code, OpenClaw)
 - Checked-in baseline inputs live under `tests/baselines/<book-id>/`; generated full-pipeline outputs live under `tests/.artifacts/`
 - README changes must be synced to both README.md and README.zh-CN.md
-- Releases follow `.claude/commands/release.md` — three commands in order: `git push origin main`, `git tag vX.Y.Z && git push --tags`, `npx clawhub@latest publish ./ --version X.Y.Z`. Do not skip the git tag; it's the only version anchor in the repo
+- GitHub releases follow `.claude/commands/release.md`: push `main`, then create and push a `vX.Y.Z` tag when a versioned release is requested. A normal push does not create a release.
 
 ## Do not
 

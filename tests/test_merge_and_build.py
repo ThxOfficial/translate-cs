@@ -1,6 +1,7 @@
 import contextlib
 import inspect
 import io
+import json
 import os
 import sys
 import tempfile
@@ -28,6 +29,59 @@ class ConvertWithPandocTests(unittest.TestCase):
         self.assertIn("--mathml", cmd)
         self.assertEqual(cmd[cmd.index("--to") + 1], "html5")
 
+    def _academic_render(self, diagnostics):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = str(Path(tmp) / "out.html")
+            def render(*_args, **_kwargs):
+                Path(output + '.pandoc.json').write_text(json.dumps(diagnostics), encoding='utf-8')
+                Path(output).write_text('<html><head></head><body>Rendered</body></html>', encoding='utf-8')
+                return SimpleNamespace(stderr='')
+            with mock.patch.object(merge_and_build.subprocess, "run", side_effect=render) as run_mock, \
+                 contextlib.redirect_stdout(io.StringIO()):
+                ok = merge_and_build.convert_with_pandoc("in.md", output, "Title", "zh-CN", academic=True)
+        return ok, run_mock.call_args.args[0]
+
+    def test_academic_reader_accepts_backslash_math_and_logs_diagnostics(self):
+        ok, cmd = self._academic_render([])
+        self.assertTrue(ok)
+        reader = cmd[cmd.index("--from") + 1]
+        self.assertIn("+tex_math_single_backslash", reader)
+        self.assertIn("markdown-smart", reader)
+        self.assertTrue(any(arg.startswith('--log=') for arg in cmd))
+
+    def test_math_warning_fails_even_when_pandoc_exits_successfully(self):
+        ok, _ = self._academic_render([{'type': 'CouldNotConvertTeXMath'}])
+        self.assertFalse(ok)
+
+    def test_localization_warning_is_recorded_without_blocking_math(self):
+        ok, _ = self._academic_render([{'type': 'CouldNotLoadTranslations'}])
+        self.assertTrue(ok)
+
+    def test_generic_reader_keeps_existing_behavior(self):
+        with mock.patch.object(merge_and_build.subprocess, "run") as run_mock, \
+             contextlib.redirect_stdout(io.StringIO()):
+            merge_and_build.convert_with_pandoc("in.md", "out.html", "Title", "en")
+        cmd = run_mock.call_args.args[0]
+        self.assertEqual(cmd[cmd.index("--from") + 1], "markdown+smart+east_asian_line_breaks")
+        self.assertNotIn("--fail-if-warnings", cmd)
+
+
+class AcademicRendererTests(unittest.TestCase):
+    def test_academic_rendering_never_falls_back_when_pandoc_fails(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            Path(temp_dir, "output.md").write_text("Equation: $x=1$", encoding="utf-8")
+            with mock.patch.object(merge_and_build, "check_pandoc_available", return_value=True), \
+                 mock.patch.object(merge_and_build, "convert_with_pandoc", return_value=False), \
+                 mock.patch.object(merge_and_build, "convert_with_python_markdown") as python_fallback, \
+                 mock.patch.object(merge_and_build, "convert_with_basic_regex") as regex_fallback, \
+                 contextlib.redirect_stdout(io.StringIO()):
+                ok = merge_and_build.convert_md_to_html(
+                    temp_dir, "Title", {"lang_attr": "zh-CN"}, academic=True
+                )
+        self.assertFalse(ok)
+        python_fallback.assert_not_called()
+        regex_fallback.assert_not_called()
+
 
 class GenerateFormatTests(unittest.TestCase):
     def _write_file(self, path, content="data"):
@@ -52,6 +106,32 @@ class GenerateFormatTests(unittest.TestCase):
 
             self.assertEqual(result, output_file)
             run_mock.assert_not_called()
+
+    def test_explicit_rebuild_ignores_an_up_to_date_format_cache(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            html_file = os.path.join(temp_dir, "book_doc.html")
+            output_file = os.path.join(temp_dir, "book.epub")
+            self._write_file(html_file, "<html></html>")
+            self._write_file(output_file, "old-epub")
+            self._set_mtime(html_file, 100)
+            self._set_mtime(output_file, 200)
+            details = {}
+
+            with mock.patch.object(
+                merge_and_build.subprocess, "run",
+                return_value=SimpleNamespace(
+                    stdout="Found Calibre ebook-convert: C:\\Calibre\\ebook-convert (calibre 7.6.0)\n",
+                    stderr="",
+                ),
+            ) as run_mock:
+                result = merge_and_build.generate_format(
+                    html_file, temp_dir, ".epub", "zh-CN", force=True, details=details
+                )
+
+            self.assertEqual(result, output_file)
+            run_mock.assert_called_once()
+            self.assertEqual(details["engine_path"], "C:\\Calibre\\ebook-convert")
+            self.assertEqual(details["engine_version"], "calibre 7.6.0")
 
     def test_rebuilds_when_image_assets_are_newer(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -150,6 +230,61 @@ class MissingCoverPathTests(unittest.TestCase):
             generate_formats_mock.assert_not_called()
 
 
+class AcademicBuildReportTests(unittest.TestCase):
+    def _run_academic_build(self, quality_status, allow_draft=False):
+        temp_dir = tempfile.TemporaryDirectory()
+        root = Path(temp_dir.name)
+        (root / "translation_spec.json").write_text(json.dumps({
+            "schema_version": 1,
+            "profile": "academic",
+            "requested_formats": ["md", "html"],
+        }), encoding="utf-8")
+
+        def merge(path):
+            (Path(path) / "output.md").write_text("translated", encoding="utf-8")
+            return True
+
+        def convert(path, *_args, **_kwargs):
+            (Path(path) / "book.html").write_text("<html>web</html>", encoding="utf-8")
+            (Path(path) / "book_doc.html").write_text("<html>doc</html>", encoding="utf-8")
+            return True
+
+        argv = ["merge_and_build.py", "--temp-dir", str(root)]
+        if allow_draft:
+            argv.append("--allow-draft")
+        with mock.patch.object(merge_and_build, "load_config", return_value={}), \
+             mock.patch.object(merge_and_build, "get_lang_config", return_value={"lang_attr": "zh-CN"}), \
+             mock.patch.object(merge_and_build.academic_quality, "build_quality_report", return_value={"quality_status": quality_status}), \
+             mock.patch.object(merge_and_build.academic_quality, "write_quality_report"), \
+             mock.patch.object(merge_and_build, "merge_markdown_files", side_effect=merge), \
+             mock.patch.object(merge_and_build, "convert_md_to_html", side_effect=convert), \
+             mock.patch.object(merge_and_build, "add_toc"), \
+             mock.patch.object(merge_and_build, "generate_formats", return_value={}) as generate_mock, \
+             mock.patch.object(sys, "argv", argv), \
+             contextlib.redirect_stdout(io.StringIO()):
+            result = merge_and_build.main()
+        generate_mock.assert_called_once()
+        self.assertTrue(generate_mock.call_args.kwargs["return_results"])
+        report = json.loads((root / "build_report.json").read_text(encoding="utf-8"))
+        temp_dir.cleanup()
+        return result, report
+
+    def test_academic_build_records_requested_formats(self):
+        result, report = self._run_academic_build("validated")
+        self.assertEqual(result, 0)
+        self.assertEqual(report["build_status"], "complete")
+        self.assertEqual(report["formats"]["md"]["status"], "ok")
+        self.assertEqual(report["formats"]["html"]["status"], "ok")
+        self.assertEqual(report["rendering"]["math_output"], "mathml")
+        self.assertEqual(report["rendering"]["status"], "ok")
+
+    def test_explicit_academic_draft_is_marked_and_returns_partial_status(self):
+        result, report = self._run_academic_build("needs_review", allow_draft=True)
+        self.assertEqual(result, 2)
+        self.assertEqual(report["quality_status"], "needs_review")
+        self.assertEqual(report["build_status"], "draft")
+
+
 class ExportAliasTests(unittest.TestCase):
     def _write(self, path, content="x"):
         Path(path).write_text(content, encoding="utf-8")
@@ -241,6 +376,18 @@ class MergeBlankOutputTests(unittest.TestCase):
             merged = (temp_dir / "output.md").read_text(encoding="utf-8")
             self.assertIn("一。", merged)
             self.assertIn("二。", merged)
+
+    def test_explicit_rebuild_remerges_validated_chunks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_dir = self._workspace(tmp)
+            self.assertTrue(merge_and_build.merge_markdown_files(str(temp_dir)))
+            self._write(temp_dir / "output.md", "stale cached content")
+
+            self.assertTrue(merge_and_build.merge_markdown_files(str(temp_dir), force=True))
+
+            rebuilt = (temp_dir / "output.md").read_text(encoding="utf-8")
+            self.assertIn("一。", rebuilt)
+            self.assertNotIn("stale cached content", rebuilt)
 
 
 class ImageValidationTests(unittest.TestCase):

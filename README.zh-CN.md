@@ -1,14 +1,8 @@
-# Rainman Translate Book
+# Translate-CS
 
 [English](README.md) | 中文
 
-面向 Codex、Claude Code 和 OpenClaw 的 Agent Skill，使用并行 subagent 将整本书（PDF/DOCX/EPUB）翻译成任意语言。
-
-<p align="center">
-  <img src="assets/poster/translate-book-poster.jpg" alt="translate-book 项目海报——一整本书,并行翻译:拆块后由 8 个并行子代理同时翻译,校验合并成完整译本" width="480">
-</p>
-
-> 本项目受 [claude_translater](https://github.com/wizlijun/claude_translater) 启发。原项目以 shell 脚本为入口，配合 Claude CLI 和多个步骤脚本完成分块翻译；本项目则将流程重构为可在 Codex、Claude Code 和 OpenClaw 中使用的 Agent Skill，使用 subagent 按 chunk 并行翻译，并引入 manifest 驱动的完整性校验，将续跑和多格式输出整合为更统一的流水线。由于项目结构和实现方式均与原项目不同，本项目为独立实现，而非 fork。
+`translate-cs` 是面向 Codex 的 Skill，用于翻译计算机科学、AI、LLM、Agent 和相关数学方向的论文与书籍，结合了可续跑的并行翻译流水线与基于证据的学术工作流。
 
 ---
 
@@ -29,7 +23,7 @@ Calibre ebook-convert → HTMLZ → HTML → Markdown
   │  每个 subagent：读取 1 个 chunk → 翻译 → 写入 output_chunk*.md
   │  分批执行，控制 API 速率
   ▼
-校验（manifest hash 比对，源文件↔输出文件 1:1 匹配）
+校验（manifest hash 比对；学术模式还检查受保护内容、Markdown 结构和审校覆盖）
   │
   ▼
 合并 → Pandoc → HTML（含目录）→ Calibre → DOCX / EPUB / PDF
@@ -47,6 +41,51 @@ Calibre ebook-convert → HTMLZ → HTML → Markdown
 - **可选输出控制** — 显式 EPUB 封面、自定义 temp root、面向用户的导出别名
 - **多语言** — zh、en、ja、ko、fr、de、es（可扩展）
 - **多格式输入** — PDF/DOCX/EPUB/Markdown，Calibre 负责格式转换；公式、表格密集的 PDF 可先用 MinerU 或 Marker 转成 Markdown
+- **学术模式** — 支持经过来源检查的 Markdown、可选本地 PDF/LaTeX 导入，以及 CS/AI/LLM/Agent/数学文献的结构保真翻译
+- **可审计的学术检查** — 每块任务上下文快照、术语首现规划、确定性结构检查、审校 sidecar、`quality_report.json` 和 `build_report.json`
+
+## 学术翻译（阶段 A、B 和 C）
+
+计算机科学、AI、LLM、Agent 系统及数学方法方向的研究论文和技术书籍使用 `academic` 模式。其他书籍仍默认走原来的通用翻译流程，旧入口和产物命名保持兼容。
+
+学术模式接受已检查的版面感知 Markdown、显式选择的本地 PDF 解析器，以及有边界的 LaTeX 工程。DOCX/EPUB 或不支持的版面先提取并检查 Markdown。Markdown 入口示例：
+
+```bash
+python3 scripts/convert.py paper.md --profile academic \
+  --document-kind paper --subject ai --subject llm --subject agent \
+  --olang zh --review-mode risk_based --review-sample-rate 0.1 \
+  --format md --format html
+```
+
+学术模式转换会生成 `ingestion.json`，记录原始来源指纹、规范化处理和图片资源映射；同时生成 `document_map.json`，记录精确源切片、Unicode 字符偏移、结构块类型、章节路径及 hash。开始翻译前，检查 `input.md` 和映射文件中的阅读顺序、公式、表格与图片目标，并记录检查结果：
+
+```bash
+python3 scripts/quality.py <temp_dir> --record-input-review \
+  --findings-file <temp_dir>/drafts/input-review.json
+```
+
+检查文件必须列出 `ingestion.json` 中的全部检查项；只有逐项检查后，才可使用空 findings 列表。目标语言为中文时，`scripts/glossary.py seed-academic` 会补入精选术语和语义说明，不覆盖手工编辑的词条；其他目标语言不会套用中文种子译法。翻译流程会先掩码受保护内容，仅在占位符与结构检查通过后恢复，并在续跑规划前记录每块使用的术语、邻块和正文首现上下文。
+
+学术审校模式包括：`risk_based`（每块记录译者自检，并对高风险块和按源 hash 可复现抽取的 10% 普通块做协调审校；普通块至少抽一块）、`full`（每块都做协调审校）和 `structural_only`。`structural_only` 始终标记为 `needs_review`。最终质量门禁还要求当前有效的来源检查 sidecar；来源记录过期、资源 hash 改变或存在未解决的审校警告时不能标记为已验证。默认正式构建要求质量报告为 `validated`；用户明确要求中间稿时可用 `--allow-draft` 构建，并在 `build_report.json` 中标记草稿。任何阶段都不证明解析器没有漏内容，也不能证明数学或语义完全正确，因此要检查解析后的 Markdown 和生成的报告。
+
+学术模式默认输出 `output.md` 和 `book.html`。只有用户需要时才添加 `--format docx`、`--format epub` 或 `--format pdf`；构建报告会分别记录请求格式的状态。模板或渲染器变化后可用 `--rebuild` 强制重建派生产物，同时保留译文、术语表和审校记录。中间 chunk、掩码任务、审校记录和质量报告都会保留以供检查。
+
+阶段 B 新增带原文证据的全文上下文。在记录任务快照前，运行 `python3 scripts/document_context.py <temp_dir> --prepare`，检查优先阅读块及定义、缩略语候选，再用 `--prepare --facts-file <facts.json>` 确认有来源支持的内容。文件须包含 `topics`、`definitions`、`abbreviations`、`symbols` 四个列表；精确证据位置和文档/章节作用域见[上下文契约](references/document-context.md)。每个任务只接收相关父级定义和局部符号；同义项冲突会显式报告，上下文超限会报错，修订只使实际使用该内容的任务快照失效。没有此文件的旧阶段 A 运行保持兼容。
+
+[B/C 执行契约](references/advanced-academic.md) 说明了已实现的命令与 schema：
+
+- 显式执行 `glossary.py migrate-v3`，兼容旧词表并增加义项、章节作用域、出现位置绑定、翻译策略与人工锁。meta v2 提议通过事务合并；同名歧义须明确裁决。
+- 添加 `--independent-review`，要求审校者及执行上下文与译者不同。`review_tasks.py` 生成任务包，每个源块最多一次持久记录的修复尝试，最终术语协调最多两轮。没有独立审校者时，所需覆盖保持未完成。
+- `convert.py paper.pdf --profile academic --pdf-parser marker`（或 `mineru`）调用已安装的本地解析器。`poppler --simple-pdf` 须显式指定，只适用纯文本 PDF。`pdf_ingest.py --pages 3:5` 单独重解析局部页面，不静默替换整本来源；不自动安装模型或上传文献。
+- LaTeX 支持选定主文件、工程内递归 include、宏/BibTeX/图片来源，以及经 Pandoc 处理的受支持定理和公式，不执行 TeX。任意 TeX 程序、复杂宏绘图和依赖特定包的文献样式须提供已检查的 Markdown。
+- 学术 DOCX 使用原生 OMML，EPUB 使用 MathML，PDF 使用 Windows 已安装 Word 或已安装 Chromium。生成成功后须通过 `format_review.py` 记录独立的外观检查；缺失或过期检查使构建保持 partial。原生格式重建失败保留旧产物；通用格式流程保持兼容。
+- 可选 `academic_views.py` 输出精确块对齐的双语 Markdown/HTML，单独呈现已确认译注及图中文字对照。`table_tasks.py` 将超长独立管道表格拆为行组，验证后提交一个规范源块对应译文。复杂 HTML rowspan 表格仍按原子块处理。数学审校规则扩展到线性代数、概率、优化与逻辑。
+
+2026-10-22 验证：320 项 stdlib 单测通过，另有真实 Pandoc HTML、Poppler 全文/局部页面、递归 LaTeX，以及五块模型翻译/独立审校/修复演示。已实际生成并检查 Pandoc 3.9 DOCX/EPUB、Word 16 PDF 样本，涵盖五个公式、中文、表格及脚注；EPUB 在内置 Chromium 中检查了 spine 内容与脚注导航。这是合成流程演示，不是准确率基准或所有阅读器的兼容认证。未安装 Marker/MinerU 模型，对应适配器只完成调用契约测试。最后一次需隐藏 Word 的原生格式集成重跑未获授权；保留先前真实渲染证据及当前单测结果。生成证据放在被忽略的 `tests/.artifacts/`。
+
+学术 HTML 显式启用美元和反斜杠公式分隔符，将 Pandoc 结构化诊断保存为 `output.html.pandoc.json`。即使 Pandoc 返回成功，不支持的数学内容也会阻止构建完成；不影响公式的本地化警告保留供检查。将 Pandoc 加入 PATH 后，可运行真实引擎检查 `python3 tests/integration/check_academic_html.py`，检查分式、根式、矩阵、上下标的 MathML 及不支持宏的失败行为；这不等同于 EPUB/PDF 外观或语义准确性验证。
+
+运行 `python3 tests/integration/check_document_context.py` 可验证上下文与续跑规划的 CLI 流程。生成产物放在 `tests/.artifacts/academic-stageB1/`，源文复制输出明确标记为流水线 mock；检查末尾定义修订只重新规划 12 块中的 2 块。此检查不依赖 Pandoc，不属于翻译质量基准。
 
 ## 前置要求
 
@@ -64,37 +103,39 @@ Calibre ebook-convert → HTMLZ → HTML → Markdown
 
 #### Codex
 
-```bash
-npx skills add deusyu/translate-book -a codex -g
-```
-
-或手动安装：
+把 GitHub 仓库克隆到 Codex 的个人 Skill 目录：
 
 ```bash
 mkdir -p ~/.agents/skills
-git clone https://github.com/deusyu/translate-book.git ~/.agents/skills/translate-book
+git clone https://github.com/ThxOfficial/translate-cs.git ~/.agents/skills/translate-cs
 ```
 
-如果新安装的 Skill 没有出现，请重启 Codex。
+Windows PowerShell 命令：
+
+```powershell
+$target = Join-Path $HOME ".agents\skills\translate-cs"
+New-Item -ItemType Directory -Force -Path (Split-Path $target) | Out-Null
+git clone https://github.com/ThxOfficial/translate-cs.git $target
+```
+
+Codex 从 `~/.agents/skills` 发现个人 Skill。运行 `/skills` 查看列表，或输入 `$translate-cs` 显式调用。Codex 会自动发现 Skill 变更；如果没有显示，再重启 Codex。
 
 #### Claude Code
 
 ```bash
-npx skills add deusyu/translate-book -a claude-code -g
+npx skills add ThxOfficial/translate-cs -a claude-code -g
 ```
 
 或手动安装：
 
 ```bash
 mkdir -p ~/.claude/skills
-git clone https://github.com/deusyu/translate-book.git ~/.claude/skills/translate-book
+git clone https://github.com/ThxOfficial/translate-cs.git ~/.claude/skills/translate-cs
 ```
 
 #### OpenClaw
 
-```bash
-openclaw skills install @deusyu/translate-book
-```
+如需在 OpenClaw 中使用，请遵循当前运行环境的本地 Skill 目录说明。
 
 ### 2. 翻译一本书
 
@@ -103,7 +144,7 @@ openclaw skills install @deusyu/translate-book
 在 Codex CLI 或 IDE 扩展中输入：
 
 ```text
-$translate-book Translate /path/to/book.pdf into Chinese.
+$translate-cs Translate /path/to/paper.pdf into Chinese, preserving formulas, terminology, and citation structure.
 ```
 
 当请求与 Skill 描述匹配时，Codex 也可以自动选择该 Skill。
@@ -119,10 +160,10 @@ translate /path/to/book.pdf to Chinese
 在 Claude Code 中也可以使用斜杠命令：
 
 ```text
-/translate-book translate /path/to/book.pdf to Japanese
+/translate-cs translate /path/to/book.pdf to Japanese
 ```
 
-Skill 自动处理完整流程 — 转换、拆分、并行翻译、校验、合并、生成所有输出格式。
+Skill 负责处理流程 — 转换、拆分、并行翻译、校验、合并和生成所请求的输出格式。
 
 ### 3. 查看输出
 
@@ -152,6 +193,21 @@ python3 ../../scripts/convert.py ../baselines/standard-alice/standard-alice.epub
 python3 ../../scripts/merge_and_build.py --temp-dir standard-alice_temp --title "test"
 ```
 
+## 推送到 GitHub
+
+当前配置的 `origin` 是 `https://github.com/ThxOfficial/translate-cs.git`，工作分支为 `main`。提交前先检查将要暂存的文件：
+
+```bash
+git status --short --branch
+git add -A
+git diff --cached --check
+git diff --cached --stat
+git commit -m "feat: specialize translate-cs for academic translation"
+git push origin main
+```
+
+`git add -A` 会暂存所有已跟踪修改和未跟踪项目文件，提交前应检查暂存摘要。推送 `main` 会更新仓库；带版本号的 GitHub Release 是单独操作。
+
 ## 反馈与贡献
 
 请优先提交详细的 GitHub issue，而不是直接从 pull request 开始。本项目按 AI 辅助的 skill pipeline 维护，任何变更都需要放在同一个由维护者掌握的上下文里，结合当前编排规则、chunk/manifest 契约、baseline 资产和发布流程一起评估。
@@ -167,19 +223,7 @@ Pull request 不是首选贡献入口，可能会被关闭并转为 issue 继续
 
 ## 联系方式
 
-Bug 和功能需求请按上一节的要求提 [GitHub issue](https://github.com/deusyu/translate-book/issues)。使用上的疑问、想法或其他事情，可以通过下面这些方式找到我：
-
-| 渠道 | 链接 |
-|------|------|
-| X (Twitter) | [@0xdeusyu](https://x.com/0xdeusyu) |
-| Telegram | [@DeusThink](https://t.me/DeusThink) |
-| Telegram 交流群 | [@talkdeusyu](https://t.me/talkdeusyu) |
-| Telegram 频道 | [@lovedesuyu](https://t.me/lovedesuyu) |
-| Email | [rainman.deus@gmail.com](mailto:rainman.deus@gmail.com) |
-
-商业赞助的说明见下方[「商业赞助」](#商业赞助)一节。
-
-频道「婴宁」记录我的见闻，以及和 AI 碰撞出的思考；交流群是它的讨论区，也欢迎来聊 translate-book。
+Bug 和功能需求请提交到 [ThxOfficial/translate-cs](https://github.com/ThxOfficial/translate-cs/issues)。
 
 ## 流程详解
 
@@ -304,12 +348,14 @@ python3 scripts/merge_and_build.py --temp-dir book_temp --title "《译后书名
 | 修改标题、模板或图片后输出未更新 | 删除 temp 目录中的 `output.md`、`book*.html`、`book.docx`、`book.epub`、`book.pdf`，然后重跑 `merge_and_build.py` |
 | 想去掉 PDF 输出中的页码 | 默认会自动识别单调递增的页码序列（如 `1, 2, 3, ...`）并删除，同时保留年份（`1984`）、章节编号、引用编号等离散的独立数字行。若识别不到你的页码格式，可给 `convert.py` 加 `--strip-page-numbers`，强制删除所有独立数字行。该标志在检测到已缓存的 `input.md` 或 `chunk*.md` 时会直接报错 — 需先删除这些缓存，标志才会生效 |
 | `output.md exists but manifest invalid` | 旧输出已过时 — 脚本会自动删除并重新合并 |
-| `Glossary upgrade rejected: duplicate source` | v2 不允许两个术语共用同一个 source/alias 表面词。手工编辑 `glossary.json` 消歧（例如把一个 source 从 `Apple` 改为 `Apple (Inc.)`）后重新加载。 |
+| `Glossary upgrade rejected: duplicate source` | 旧版 v2 词表要求表面词唯一。学术翻译可显式运行 `python3 scripts/glossary.py migrate-v3 <temp_dir>` 迁移到 v3，再用经过审阅的词面绑定解决多义词。 |
 | PDF 生成失败 | 确认 Calibre 已安装且支持 PDF 输出 |
 
-## 后续规划
+## 通用流水线能力
 
-跟踪 [issue #7](https://github.com/deusyu/translate-book/issues/7) — chunk 之间的人名/术语不一致以及代词/性别错误。当前流水线已覆盖高频实体、别名/拼写漂移、相邻 chunk 的代词上下文，以及术语表变更后的精确重译。整书自然度校验仍是后续质量阶段。整体方案分为四个可独立交付的阶段。
+这些能力与学术 profile 并行保留。尚未完成的验证事项见[学术交付状态](docs/CS_AI_TRANSLATION_SPEC.md#135-当前尚未完成的验收和发布工作)。
+
+通用流水线支持有作用域的术语、来源证据上下文和精确重译。真实技术书籍的整本翻译尚未完成自然度验证。
 
 ### 设计原则
 
@@ -336,34 +382,24 @@ Phase 1 让术语表按批次增长,因此第一批看到的术语表最小,drif
 
 > Phase 4 仍取决于真实书籍运行数据。已发布的 schema 后续如果暴露问题，也应通过兼容性迁移继续演进。
 
-### 平行线路 — Pipeline / UX backlog（部分已发布,独立于 issue #7）
+### Pipeline / UX 能力（部分完成）
 
 最近几轮 PR 讨论也暴露出一些有价值的工作流改进,但它们都不属于“一次性小补丁”：会触及仓库契约（产物命名、temp-dir 行为、清理语义、或 EPUB 兼容性边界）。当前状态：
 
-- **显式 EPUB 封面支持（已发布）**。`merge_and_build.py --cover <image>` 会在 HTML -> EPUB 的 Calibre 步骤透传封面图。`--cover-from <epub>` / EPUB 封面自动提取仍不纳入当前范围,等项目准备好承担不同 EPUB 包布局的解析兼容性后再考虑。(context: closed #3)
-- **可配置的 temp 工作目录位置（已发布）**。`convert.py --temp-root <dir>` 保留默认 cwd-local `{book_name}_temp/` 行为，只有显式传参时才改变父目录。(context: closed #4)
-- **更安全的 Calibre/Pandoc 噪声清理（部分已发布）**。页码和 Calibre marker 清理已有回归测试保护，保留年份、章节编号和非单调独立数字。后续清理规则继续在测试下增量增加。(context: closed #5)
-- **可选的面向用户导出文件名（已发布）**。`merge_and_build.py --export-name <stem>` 生成 alias/copy，同时流水线内部 canonical 产物仍保持 `book.html`、`book_doc.html`、`book.docx`、`book.epub`、`book.pdf`。(context: closed #6)
+- **显式 EPUB 封面支持（已实现）**。`merge_and_build.py --cover <image>` 会在 HTML -> EPUB 的 Calibre 步骤透传封面图。`--cover-from <epub>` / EPUB 封面自动提取仍不纳入当前范围，待项目准备好承担不同 EPUB 包布局的解析兼容性后再考虑。
+- **可配置的 temp 工作目录位置（已实现）**。`convert.py --temp-root <dir>` 保留默认 cwd-local `{book_name}_temp/` 行为，只有显式传参时才改变父目录。
+- **更安全的 Calibre/Pandoc 噪声清理（部分实现）**。页码和 Calibre marker 清理已有回归测试保护，保留年份、章节编号和非单调独立数字。后续清理规则继续在测试下增量增加。
+- **可选的面向用户导出文件名（已实现）**。`merge_and_build.py --export-name <stem>` 生成 alias/copy，同时流水线内部 canonical 产物仍保持 `book.html`、`book_doc.html`、`book.docx`、`book.epub`、`book.pdf`。
 
 ## Star History
 
 如果这个项目对您有帮助，请考虑为其点亮一颗 Star ⭐！
 
-[![Star History Chart](https://api.star-history.com/svg?repos=deusyu/translate-book&type=Date)](https://star-history.com/#deusyu/translate-book&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=ThxOfficial/translate-cs&type=Date)](https://star-history.com/#ThxOfficial/translate-cs&Date)
 
-## 赞助
+## 模型执行
 
-如果这个项目帮你节省了时间，欢迎赞助支持后续维护和改进。
-
-[![Sponsor](https://img.shields.io/github/sponsors/deusyu?label=Sponsor&logo=github)](https://github.com/sponsors/deusyu)
-
-### 商业赞助
-
-欢迎企业赞助 translate-book，合作方式可以商量，请发邮件至 [rainman.deus@gmail.com](mailto:rainman.deus@gmail.com)。
-
-不接受：
-
-- 在 README 或文档中加入第三方模型平台 / API 中转站的配置教程、Base URL 或环境变量。translate-book 本身不调用任何模型 API，翻译在用户自己的 agent 宿主（Codex、Claude Code、OpenClaw）里完成。
+`translate-cs` 不直接调用模型 API。翻译和审校由用户自己的 Agent 宿主执行，例如 Codex、Claude Code 或 OpenClaw。
 
 ## License
 
